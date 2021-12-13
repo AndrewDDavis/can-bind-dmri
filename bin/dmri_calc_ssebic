@@ -1,0 +1,1168 @@
+#!/usr/bin/env python3
+# coding: utf-8
+"""Calculate model MSE and BIC values from model fits for the non-tensor models manuscript.
+
+Run from a subject's dmripp dir.
+Will output a CSV with the SSE and BIC values, and some plots. Plot values with ntmod_sse_bic_plots.py
+
+Can also run from dmriproj/data/nontensor_models dir in ipython using:
+for d in glob('*'):
+    os.chdir(f'{d}/dmripp')
+    print(f'running {d}')
+    %run /home/andrew/dmriproj/bin/dmri_calc_ssebic
+    os.chdir('../../')
+"""
+
+__author__ = "Andrew Davis (addavis@gmail.com)"
+__version__ = "0.1 (Oct 2019)"
+__license__ = "Distributed under The MIT License (MIT).  See http://opensource.org/licenses/MIT for details."
+
+import os, sys
+import nibabel as nib
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D     # for 3D plots
+import decimal as dec
+dec.getcontext().prec = 100         # when high precision needed
+
+import dmri_utils as du
+
+# or, for absolute import:
+# import importlib.util
+# spec = importlib.util.spec_from_file_location("dmri_utils", "/home/andrew/dmriproj/bin/dmri_utils.py")
+# du = importlib.util.module_from_spec(spec)
+# spec.loader.exec_module(du)
+
+# Plot look
+plt.rcParams['font.size'] = 10
+plt.rcParams['axes.labelsize'] = 'medium'
+plt.rcParams['xtick.labelsize'] = 'small'
+plt.rcParams['ytick.labelsize'] = 'small'
+
+plt.rcParams['lines.markersize'] = 3.25
+plt.rcParams['legend.framealpha'] = 0.9
+
+plt.rcParams['mathtext.fontset'] = 'custom'     # to set individual subfamily values
+plt.rcParams['mathtext.cal'] = 'stix:italic'
+
+plt.rcParams['figure.constrained_layout.use'] = True
+# plt.rcParams['figure.constrained_layout.w_pad'] = 3./72
+# plt.rcParams['figure.constrained_layout.h_pad'] = 3./72
+# plt.rcParams['figure.constrained_layout.wspace'] = 0.015
+# plt.rcParams['figure.constrained_layout.hspace'] = 0.015
+
+# B, R, G colour scheme
+colors = ['#336699', '#990033', '#669966']
+# Alternate 6-colour scheme
+# 21B6A8    177F75  B6212D  7F171F  B67721  7F5417
+
+# Blue, tan, maroon for the bars
+blu = colors[0]
+tan = '#C2883A'
+mrn = '#7F171F'
+
+
+def main(run_tens=True, run_m1n1=True, run_m1n2=True, run_m3n1=True, run_m3n2=True):
+    # Definitions
+    # See https://www.sfu.ca/sasdoc/sashtml/ets/chap30/sect19.htm
+    # n is the number of nonmissing observations
+    # k is the number of fitted parameters in the model
+    # y is observed, yhat is predicted
+    # SSE = sum((y - yhat)^2)
+    # MSE = 1/n*SSE
+    # BIC = n*ln(SSE/n) + k*ln(n)
+    # note unbiased MSE for regression is 1/(n-k-1)*SSE, but we don't use that for BIC
+
+    # WM-masks
+    wmmask_nii = du.check_load_nii('wm_mask.nii.gz')
+    wmmask = wmmask_nii.get_fdata()
+    wmmask = (wmmask == 1)          # boolean, sum = 36499
+
+    linwm_nii = du.check_load_nii('mask-linear_anis.nii.gz')  # 2% = 729 selected voxels; see dmasks
+    linwm_mask = linwm_nii.get_fdata()
+    linwm_mask = (linwm_mask == 1)
+
+    plawm_nii = du.check_load_nii('mask-planar_anis.nii.gz')
+    plawm_mask = plawm_nii.get_fdata()
+    plawm_mask = (plawm_mask == 1)
+
+
+    # Read mask and observed values
+    nii_fnp = 'dwi_stdpp'
+
+    # b-values
+    bvals = np.genfromtxt(nii_fnp + '.bval')
+    n_obs = len(bvals)
+
+    t2w_vols = (bvals == 0)
+
+    # gradient directions
+    bvecs = np.genfromtxt(nii_fnp + '.bvec')
+
+    # brain mask
+    # mask_nii = du.check_load_nii('mask-rough_brain.nii.gz')
+    mask_nii = du.check_load_nii('mask-fine_brain.nii.gz')
+    mask = mask_nii.get_fdata()
+    mask = (mask == 1)           # boolean
+    n_vxls = mask.sum()          # 98784 -- the same mask is used everywhere
+
+    shape_1d = (n_vxls,)
+
+    # measured Si
+    nii = du.check_load_nii(nii_fnp + '.nii.gz')
+    dt2wi_data = nii.get_fdata()
+    dt2wi_2d = dt2wi_data[mask, :]  # 98784, 37
+
+    shape_4d = dt2wi_data.shape
+    shape_3d = shape_4d[0:3]
+
+    # zeros within the mask cause problems for log
+    #   there are 79 total in UCA; identify them and replace with 1
+    trouble_spots = (dt2wi_2d <= 0)
+    dt2wi_2d[trouble_spots] = 1
+    if trouble_spots.sum() > 0:
+        print(f"Found {trouble_spots.sum()} trouble spots")
+
+
+    # Tensor
+    # S_i = S_0*exp(-b ri^T D ri)
+    # let ri be the unit directional vector of the i-th gradient, [ri,x ri,y ri,z]^T = [cosθicosφi cosθisinφi sinθi]^T
+    # note the definitions of the vectors are column vectors, so they can multiply the D tensor
+    # note the linear (unweighted) tensor had slightly lower SSE, as would be expected: Mean WM = 0.081
+
+    if run_tens:
+
+        tens_modir = 'wdt/'
+        print(f"Tensor model: calculating initial values in {tens_modir}...")
+
+        # calculated values files:
+        # - S0: wdt/wdt_S0.nii.gz
+        # - tensor values: wdt/wdt_tensor_upper.nii.gz
+        # - FSL's sse values: wdt/wdt_sse.nii.gz
+
+        s0_nii = du.check_load_nii(tens_modir + tens_modir[0:3] + '_S0.nii.gz')
+        s0_data = s0_nii.get_fdata()
+        s0_vec = s0_data[mask]       # 3D to 1D -> 98784
+
+        tens_nii = du.check_load_nii(tens_modir + tens_modir[0:3] + '_tensor_upper.nii.gz')
+        tens_data = tens_nii.get_fdata()/1000.      # undo unit conversion in dmri_preprocess
+        tens_2d = tens_data[mask, :]                # 4D to 2D -> 98784, 6
+
+        sse_nii = du.check_load_nii(tens_modir + tens_modir[0:3] + '_sse.nii.gz')
+        sse_data = sse_nii.get_fdata()
+
+        # Consider each gradient direction and voxel within the mask
+        # also include the b=0 volumes; now matches FSL's output within FP error:
+        # 1.4494447526050234
+        # 1.4494446516036987
+        tens_sse = np.zeros(shape_3d)
+        tens_si_pred = np.zeros(shape_4d)
+
+        # loop over gradient directions
+        for i in range(n_obs):
+            print(f"  DWI image: {i}...", end='\r')
+
+            # Operate within the mask
+            si_vec = dt2wi_2d[:, i]   # 1D -> 98784
+
+            if t2w_vols[i]:
+                # model returns S_0 when b=0
+                si_pred = s0_vec
+
+            else:
+                r_i = bvecs[:, i].reshape(3, 1)     # column vector
+
+                b_i = bvals[i]
+
+                si_pred = np.zeros(shape_1d)
+
+                # example_voxel
+                # ev = (48, 61, 27)
+
+                # loop over voxels in mask to do matrix multiplication
+                for ev in range(n_vxls):
+                    Dxx, Dxy, Dxz, Dyy, Dyz, Dzz = tens_2d[ev, :]
+
+                    Deff = np.array([[Dxx, Dxy, Dxz],
+                                     [Dxy, Dyy, Dyz],
+                                     [Dxz, Dyz, Dzz]])
+
+                    si_pred[ev] = s0_vec[ev]*np.exp(-b_i * (r_i.T @ Deff @ r_i).item())
+                                                            # could also use λ1(r.v1)^2 + λ2(r.v2)^2 + λ3(r.v3)^2
+
+            tens_si_pred[mask, i] = si_pred
+
+            sqerr = (np.log(si_pred) - np.log(si_vec))**2  # need to use logs (ln) here to match FSL
+                                                           # see https://www.jiscmail.ac.uk/cgi-bin/webadmin?A2=FSL;78792524.0905
+                                                           # and https://www.jiscmail.ac.uk/cgi-bin/webadmin?A2=ind1001&L=FSL&D=0&P=147804
+
+            # by my def'n
+            sqerr[trouble_spots[:, i]] = 1
+
+            tens_sse[mask] += sqerr
+
+        print("")
+
+        # calc BIC from SSE
+        n_params = 7
+        tens_bic = np.zeros(shape_3d)
+        tens_bic[mask] = n_obs*np.log(tens_sse[mask]/n_obs) + n_params*np.log(n_obs)
+
+        du.make_nii(tens_sse, new_aff=nii.affine).to_filename(tens_modir + tens_modir[0:3] + '_SSE_mycalc.nii.gz')
+        du.make_nii(tens_bic, new_aff=nii.affine).to_filename(tens_modir + tens_modir[0:3] + '_BIC.nii.gz')
+        du.make_nii(tens_si_pred, new_aff=nii.affine).to_filename(tens_modir + tens_modir[0:3] + '_Si_pred.nii.gz')
+
+
+    # Compartment models
+
+    # Orientation convention
+    # BedpostX uses: theta = polar co-ordinate (with z axis)
+    #                  phi = azimuth co-ord (with x axis)
+    # See Saad's comment: https://www.jiscmail.ac.uk/cgi-bin/webadmin?A2=FSL;dc55828a.1710
+    # Also see Anderson, 2005 for tensor convention: note lambda-parallel is Dzz! *Not* as in Behrens, 2003
+    # Note Yang 2019 paper seems to have mistakes in Rk, even if it does use matlab convention for angles.
+    #
+    # Rotation matrices
+    # see https://en.wikipedia.org/wiki/Rotation_matrix#In_three_dimensions
+    # and https://math.stackexchange.com/questions/1051613
+    # Rz = np.array([[np.cos(phi), -np.sin(phi), 0],
+    #                [np.sin(phi),  np.cos(phi), 0],
+    #                [          0,            0, 1]])
+    #
+    # # right handed (polar angle) -- for left handed = transpose, i.e. flip signs of sin(theta)
+    # Ry = np.array([[ np.cos(theta), 0, np.sin(theta)],
+    #                [             0, 1,             0],
+    #                [-np.sin(theta), 0, np.cos(theta)]])
+    #
+    # e.g. apply with
+    # zvec=np.array([0, 0, 1]).reshape([3,1])
+    # Rz @ Ry @ zvec
+
+    def read_model_data(modir, two_fiber=False, multiexp=False, zeppelin=False):
+        """read niftis and import data"""
+        # need files for:
+        # - brain mask: nodif_brain_mask.nii.gz
+        # - calculated S0: mean_S0samples.nii.gz
+        # - calculated d: mean_dsamples.nii.gz
+        # - calculated f1: mean_f1samples.nii.gz
+        # - calculated phi1: mean_ph1samples.nii.gz
+        # - calculated theta1: mean_th1samples.nii.gz
+
+        data_dict = {}
+
+        mask_nii = du.check_load_nii(modir + 'nodif_brain_mask.nii.gz')
+        mask = mask_nii.get_fdata()
+        mask = (mask == 1)      # boolean
+        data_dict['mask'] = mask
+
+        s0_nii = du.check_load_nii(modir + 'mean_S0samples.nii.gz')
+        s0_data = s0_nii.get_fdata()
+        data_dict['s0_data'] = s0_data
+        data_dict['s0_vec'] = s0_data[mask]  # 3D to 1D -> 98784
+
+        d_nii = du.check_load_nii(modir + 'mean_dsamples.nii.gz')
+        d_data = d_nii.get_fdata()/1000.      # undo unit conversion
+        data_dict['d_data'] = d_data
+        data_dict['d_vec'] = d_data[mask]
+
+        f1_nii = du.check_load_nii(modir + 'mean_f1samples.nii.gz')
+        f1_data = f1_nii.get_fdata()
+        data_dict['f1_data'] = f1_data
+        data_dict['f1_vec'] = f1_data[mask]
+
+        ph1_nii = du.check_load_nii(modir + 'mean_ph1samples.nii.gz')
+        ph1_data = ph1_nii.get_fdata()
+        data_dict['ph1_data'] = ph1_data
+        data_dict['ph1_vec'] = ph1_data[mask]
+
+        th1_nii = du.check_load_nii(modir + 'mean_th1samples.nii.gz')
+        th1_data = th1_nii.get_fdata()
+        data_dict['th1_data'] = th1_data
+        data_dict['th1_vec'] = th1_data[mask]
+
+        dyads1_nii = du.check_load_nii(modir + 'dyads1.nii.gz')
+        dyads1_data = dyads1_nii.get_fdata()
+        data_dict['dyads1_data'] = dyads1_data
+        data_dict['dyads1_vec'] = dyads1_data[mask]
+
+        if two_fiber:
+            # read second fiber niftis
+            f2_nii = du.check_load_nii(modir + 'mean_f2samples.nii.gz')
+            f2_data = f2_nii.get_fdata()
+            data_dict['f2_data'] = f2_data
+            data_dict['f2_vec'] = f2_data[mask]
+
+            ph2_nii = du.check_load_nii(modir + 'mean_ph2samples.nii.gz')
+            ph2_data = ph2_nii.get_fdata()
+            data_dict['ph2_data'] = ph2_data
+            data_dict['ph2_vec'] = ph2_data[mask]
+
+            th2_nii = du.check_load_nii(modir + 'mean_th2samples.nii.gz')
+            th2_data = th2_nii.get_fdata()
+            data_dict['th2_data'] = th2_data
+            data_dict['th2_vec'] = th2_data[mask]
+
+            dyads2_nii = du.check_load_nii(modir + 'dyads2.nii.gz')
+            dyads2_data = dyads2_nii.get_fdata()
+            data_dict['dyads2_data'] = dyads2_data
+            data_dict['dyads2_vec'] = dyads2_data[mask]
+
+        if multiexp:
+            # read d_std
+            dstd_nii = du.check_load_nii(modir + 'mean_d_stdsamples.nii.gz')
+            dstd_data = dstd_nii.get_fdata()/1000.      # undo unit conversion
+            data_dict['dstd_data'] = dstd_data
+            data_dict['dstd_vec'] = dstd_data[mask]
+
+        if zeppelin:
+            # read radial samples
+            lR_nii = du.check_load_nii(modir + 'mean_Rsamples.nii.gz')
+            lR_data = lR_nii.get_fdata()
+            data_dict['lR_data'] = lR_data
+            data_dict['lR_vec'] = lR_data[mask]
+
+        return data_dict
+
+
+    # right handed (polar angle) rotation
+    def RzRy(theta, phi):
+        # Rz @ Ry
+        return np.array([[np.cos(phi)*np.cos(theta), -np.sin(phi), np.cos(phi)*np.sin(theta)],
+                         [np.sin(phi)*np.cos(theta), np.cos(phi), np.sin(phi)*np.sin(theta)],
+                         [-np.sin(theta), 0, np.cos(theta)]])
+
+    # rotate in the opposite way
+    def opp_rot(theta, phi):
+        # using Ry.T @ Rz.T since a rotation matrix's transpose is its inverse
+        Ry = np.array([[np.cos(theta), 0, np.sin(theta)],
+                       [0, 1, 0],
+                       [-np.sin(theta), 0, np.cos(theta)]])
+        Rz = np.array([[np.cos(phi), -np.sin(phi), 0],
+                       [np.sin(phi), np.cos(phi), 0],
+                       [0, 0, 1]])
+        return Ry.T @ Rz.T
+
+    # stick tensor
+    # as in Anderson, 2005 -- parallel component is Dzz for polar convention!
+    A = np.array([[0, 0, 0],
+                  [0, 0, 0],
+                  [0, 0, 1]])
+
+
+    # Ball-stick BS1 (1 fiber, monoexponential)
+    # S_i = S_0*[(1 - sum_k(f_k))exp(-b_i d) + sum_k(f_k*exp(-b d ri^T R_k A R_k^T ri))]
+    # Rk is the rotation matrix to orient the stick for the k^th fibre
+    # theta is inclination (polar angle) (0, π)
+    # phi is azimuth (−π, +π)
+
+    if run_m1n1:
+
+        m1n1_modir = 'ntmod_m1_n1_b50000.bedpostX-A/'
+        print(f"M1-N1 model: calculating initial values in {m1n1_modir}...")
+
+        try:
+            m1n1_data = read_model_data(m1n1_modir)
+        except FileNotFoundError:
+            print("  Warning -- using burn-in = 1000 data")
+            m1n1_modir = 'ntmod_m1_n1_b1000.bedpostX-A/'
+            m1n1_data = read_model_data(m1n1_modir)
+
+        # loop over mask voxels and extract params
+        params_vec = []
+        for ev in range(n_vxls):
+            th1 = m1n1_data['th1_vec'][ev]
+            ph1 = m1n1_data['ph1_vec'][ev]
+
+            R1 = RzRy(th1, ph1)
+
+            # S_0*[(1 - sum_k(f_k))exp(-b_i d) + sum_k(f_k*exp(-b d ri^T R_k A R_k^T ri))]
+            # notation from Behrens 2007
+            s0 = m1n1_data['s0_vec'][ev]
+            f1 = m1n1_data['f1_vec'][ev]
+            d = m1n1_data['d_vec'][ev]
+
+            params_vec.append((s0, f1, d, th1, ph1, R1))
+
+        # loop over gradient directions to calculate signal estimates
+        m1n1_sse = np.zeros(shape_3d)
+        m1n1_si_pred = np.zeros(shape_4d)
+
+        for i in range(n_obs):
+            print("  DWI images [" + "x"*(i+1) + "-"*(n_obs-i-1) + "]", end='\r')
+
+            # Operate within the mask at this index
+            si_vec = dt2wi_2d[:, i]
+
+            if t2w_vols[i]:
+                # model returns S_0 when b=0
+                si_pred = m1n1_data['s0_vec']
+
+            else:
+                r_i = bvecs[:, i].reshape(3, 1)     # column vector
+
+                b_i = bvals[i]
+
+                si_pred = np.zeros(shape_1d)
+
+                # loop over voxels in mask to do matrix multiplication
+                for ev in range(n_vxls):
+                    s0, f1, d, _, _, R1 = params_vec[ev]
+
+                    si_pred[ev] = s0*((1 - f1)*np.exp(-b_i * d) \
+                                       + f1*np.exp(-b_i * d * (r_i.T @ R1 @ A @ R1.T @ r_i).item()))
+
+            m1n1_si_pred[mask, i] = si_pred
+
+            sqerr = (np.log(si_pred) - np.log(si_vec))**2
+
+            # by my def'n
+            sqerr[trouble_spots[:, i]] = 1
+
+            m1n1_sse[mask] += sqerr
+
+        print("")
+
+        # calc BIC from SSE
+        n_params = 5
+        m1n1_bic = np.zeros(shape_3d)
+        m1n1_bic[mask] = n_obs*np.log(m1n1_sse[mask]/n_obs) + n_params*np.log(n_obs)
+
+        du.make_nii(m1n1_sse, new_aff=nii.affine).to_filename(m1n1_modir + 'm1n1_SSE.nii.gz')
+        du.make_nii(m1n1_bic, new_aff=nii.affine).to_filename(m1n1_modir + 'm1n1_BIC.nii.gz')
+        du.make_nii(m1n1_si_pred, new_aff=nii.affine).to_filename(m1n1_modir + 'm1n1_Si_pred.nii.gz')
+
+
+    # Ball-stick BSS1 (2 fibers, monoexponential)
+    # S_i = S_0*[(1 - sum_k(f_k))exp(-b_i d) + sum_k(f_k*exp(-b d ri^T R_k A R_k^T ri))]
+
+    if run_m1n2:
+
+        m1n2_modir = 'ntmod_m1_n2_b50000.bedpostX-A/'
+        print(f"M1-N2 model: calculating initial values in {m1n2_modir}...")
+
+        m1n2_data = read_model_data(m1n2_modir, two_fiber=True)
+
+        # loop over mask voxels and extract params
+        params_vec = []
+        for ev in range(n_vxls):
+            th1 = m1n2_data['th1_vec'][ev]
+            th2 = m1n2_data['th2_vec'][ev]
+            ph1 = m1n2_data['ph1_vec'][ev]
+            ph2 = m1n2_data['ph2_vec'][ev]
+
+            R1 = RzRy(th1, ph1)
+            R2 = RzRy(th2, ph2)
+
+            # S_0*[(1 - sum_k(f_k))exp(-b_i d) + sum_k(f_k*exp(-b d ri^T R_k A R_k^T ri))]
+            # notation from Behrens 2007
+            s0 = m1n2_data['s0_vec'][ev]
+            f1 = m1n2_data['f1_vec'][ev]
+            f2 = m1n2_data['f2_vec'][ev]
+            d = m1n2_data['d_vec'][ev]
+
+            params_vec.append((s0, f1, f2, d, th1, ph1, th2, ph2, R1, R2))
+
+        # loop over gradient directions to calculate signal estimates
+        m1n2_sse = np.zeros(shape_3d)
+        m1n2_si_pred = np.zeros(shape_4d)
+
+        for i in range(n_obs):
+            print("  DWI images [" + "x"*(i+1) + "-"*(n_obs-i-1) + "]", end='\r')
+
+            # Operate within the mask at this index
+            si_vec = dt2wi_2d[:, i]
+
+            if t2w_vols[i]:
+                # model returns S_0 when b=0
+                si_pred = m1n2_data['s0_vec']
+
+            else:
+                r_i = bvecs[:, i].reshape(3, 1)     # column vector
+
+                b_i = bvals[i]
+
+                si_pred = np.zeros(shape_1d)
+
+                # loop over voxels in mask to do matrix multiplication
+                for ev in range(n_vxls):
+                    s0, f1, f2, d, _, _, _, _, R1, R2 = params_vec[ev]
+
+                    si_pred[ev] = s0*((1 - f1 - f2)*np.exp(-b_i * d) \
+                                      + f1*np.exp(-b_i * d * (r_i.T @ R1 @ A @ R1.T @ r_i).item()) \
+                                      + f2*np.exp(-b_i * d * (r_i.T @ R2 @ A @ R2.T @ r_i).item()))
+
+            m1n2_si_pred[mask, i] = si_pred
+
+            sqerr = (np.log(si_pred) - np.log(si_vec))**2
+
+            # by my def'n
+            sqerr[trouble_spots[:, i]] = 1
+
+            m1n2_sse[mask] += sqerr
+
+        print("")
+
+        # calc BIC from SSE
+        n_params = 8
+        m1n2_bic = np.zeros(shape_3d)
+        m1n2_bic[mask] = n_obs*np.log(m1n2_sse[mask]/n_obs) + n_params*np.log(n_obs)
+
+        du.make_nii(m1n2_sse, new_aff=nii.affine).to_filename(m1n2_modir + 'm1n2_SSE.nii.gz')
+        du.make_nii(m1n2_bic, new_aff=nii.affine).to_filename(m1n2_modir + 'm1n2_BIC.nii.gz')
+        du.make_nii(m1n2_si_pred, new_aff=nii.affine).to_filename(m1n2_modir + 'm1n2_Si_pred.nii.gz')
+
+
+    # Ball-stick BSS2 (2 fibers, multi-exponential)
+    # In latex:
+    # S_i = S_0 \left(1 - \sum_k f_k \right) \left(\frac{\Beta}{\Beta + b_i} \right)^\alpha + \sum_k f_k \left( \frac{\Beta}{\Beta + b_i(g_i^T x_k)^2} \right)^\alpha
+
+    # not implemented
+
+
+    # Ball-Zeppelin (1 fiber)
+
+    # See Sotiropoulos 2016, Eq. 5
+    # and my Q: https://www.jiscmail.ac.uk/cgi-bin/webadmin?A2=FSL;33054c92.1910
+    #
+    # Sk = S0[(1 - sum(f))*(dm/(dm+bk*dstd**2))^(dm**2/dstd**2)
+    #         + f1*exp(-bk*3lm/(2lR+1)*((1-lR)*(gk.vn^T)**2_lR))]
+
+    if run_m3n1:
+
+        m3n1_modir = 'ntmod_m3_n1_b50000.bedpostX-A/'
+        print(f"M3-N1 model: calculating initial values in {m3n1_modir}...")
+
+        try:
+            m3n1_data = read_model_data(m3n1_modir, multiexp=True, zeppelin=True)
+        except FileNotFoundError:
+            print("  Warning -- using burn-in = 1000 data")
+            m3n1_modir = 'ntmod_m3_n1_b1000.bedpostX-A/'
+            m3n1_data = read_model_data(m3n1_modir, multiexp=True, zeppelin=True)
+
+        # loop over mask voxels and extract params
+        params_vec = []
+        dec_mdl_used = 0
+
+        for ev in range(n_vxls):
+            # calc v1 from 3D angles
+            # th1 = m3n1_data['th1_vec'][ev]
+            # ph1 = m3n1_data['ph1_vec'][ev]
+
+            # R1 = RzRy(th1, ph1)
+            # v1 = (R1 @ np.array([[0], [0], [1]])).reshape(1,3)
+
+            # or calc directly
+            # v1 = np.array([[np.sin(th1)*np.cos(ph1), np.sin(th1)*np.sin(ph1), np.cos(th1)]])
+
+            # or use dyads1 -- all give essentially equivalent answers
+            v1 = (m3n1_data['dyads1_vec'][ev, :]).reshape(1, 3)
+
+            # Sk = S0[(1 - sum(f))*(dm/(dm+bk*dstd**2))^(dm**2/dstd**2)
+            #          + f1*exp(-bk*3lm/(2lR+1)*((1-lR)*(gk.vn^T)**2+lR))]
+            s0 = m3n1_data['s0_vec'][ev]
+            f1 = m3n1_data['f1_vec'][ev]
+            dm = m3n1_data['d_vec'][ev]
+            dstd = m3n1_data['dstd_vec'][ev]
+            lm = dm
+            lR = m3n1_data['lR_vec'][ev]
+
+            # solve for lambda 1 and 2 from eq'ns in Sotiropoulus 2016
+            l1 = 3*lm/(2*lR + 1)
+            l2 = lR*l1
+
+            # then recreate the tensors and use them to calculate predicted signal
+            D1 = (l1 - l2)*v1.T @ v1 + l2*np.eye(3)     # could also use np.outer(v1, v1) with 1D array
+                                                        # can be thought of as projection matrix (onto v1)
+                                                        # this matrix is symmetric, and the trace is
+                                                        # the dot product, i.e. norm of vector v1 (=1)
+
+            # calculate the isotropic diffusion component here to save time
+            b_i = bvals.max()
+            # assuming single-shell data here
+            assert np.all(bvals[~t2w_vols] == b_i)
+
+            iso_fac = (dm/(dm + b_i*dstd**2))**(dm**2/dstd**2)
+
+            # check whether the isotropic term has collapsed to 1.0
+            # for more discussion see m3n2
+            if (dstd < 1e-9) or (iso_fac == 1.0):
+                # use the decimal module to get added precision
+                dec_mdl_used += 1
+                dm_dec, dstd_dec, b_i_dec = map(dec.Decimal, [dm, dstd, b_i])
+
+                iso_fac = float((dm_dec/(dm_dec + b_i_dec*dstd_dec**2))**(dm_dec**2/dstd_dec**2))
+
+                if (dstd < 1e-45) or (iso_fac == 1.0):
+                    # may still need more precision
+                    raise ValueError(f"  dstd too small? {dstd} at ev={ev}, iso_fac = {iso_fac}")
+
+            params_vec.append((s0, f1, dm, dstd, lm, lR, l1, l2, v1, D1, iso_fac))
+
+        if dec_mdl_used > 0:
+            p = 100*dec_mdl_used/n_vxls
+            print(f"  Decimal module was used {dec_mdl_used} times ({p:.2f} percent)")
+
+
+        m3n1_sse = np.zeros(shape_3d)
+        m3n1_si_pred = np.zeros(shape_4d)
+
+        # loop over gradient directions
+        for i in range(n_obs):
+            print("  DWI images [" + "x"*(i+1) + "-"*(n_obs-i-1) + "]", end='\r')
+
+            # Operate within the mask at this index
+            si_vec = dt2wi_2d[:, i]
+
+            if t2w_vols[i]:
+                # model returns S_0 when b=0
+                si_pred = m3n1_data['s0_vec']
+
+            else:
+                r_i = bvecs[:, i].reshape(1, 3)     # row vector
+
+                b_i = bvals[i]
+
+                si_pred = np.zeros(shape_1d)
+
+                # loop over voxels in mask to do matrix multiplication
+                for ev in range(n_vxls):
+                    s0, f1, dm, dstd, lm, lR, _, _, v1, _, iso_fac = params_vec[ev]
+
+                    # note, for the f1 term, using the tensor gives the same result as the Sot2016 form
+                    f1_fac = np.exp(-b_i*3*lm/(2*lR + 1)*((1 - lR)*(r_i@v1.T).item()**2 + lR))
+
+                    si_pred[ev] = s0*((1 - f1)*iso_fac + f1*f1_fac)
+
+            m3n1_si_pred[mask, i] = si_pred
+
+            sqerr = (np.log(si_pred) - np.log(si_vec))**2
+
+            # by my def'n
+            sqerr[trouble_spots[:, i]] = 1
+
+            m3n1_sse[mask] += sqerr
+
+        print("")
+
+        # calc BIC from SSE
+        # n_params = 7
+        n_params = 6    # d_std not used in 99.9% of voxels
+        m3n1_bic = np.zeros(shape_3d)
+        m3n1_bic[mask] = n_obs*np.log(m3n1_sse[mask]/n_obs) + n_params*np.log(n_obs)
+
+        du.make_nii(m3n1_sse, new_aff=nii.affine).to_filename(m3n1_modir + 'm3n1_SSE.nii.gz')
+        du.make_nii(m3n1_bic, new_aff=nii.affine).to_filename(m3n1_modir + 'm3n1_BIC.nii.gz')
+        du.make_nii(m3n1_si_pred, new_aff=nii.affine).to_filename(m3n1_modir + 'm3n1_Si_pred.nii.gz')
+
+
+    # Ball-Zeppelin (2 fiber)
+    # Note: turned on ARD for 2nd fiber, and SSE went up slightly: 0.109 instead of 0.100
+
+    if run_m3n2:
+
+        m3n2_modir = 'ntmod_m3_n2_b50000.bedpostX-A/'
+        print(f"M3-N2 model: calculating initial values in {m3n2_modir}...")
+
+        m3n2_data = read_model_data(m3n2_modir, two_fiber=True, multiexp=True, zeppelin=True)
+
+        # loop over mask voxels and extract params
+        params_vec = []
+        l1_vec = []
+        l2_vec = []
+        dec_mdl_used = 0
+
+        for ev in range(n_vxls):
+            # calc v1 from 3D angles
+            # th1 = m3n2_data['th1_vec'][ev]
+            # ph1 = m3n2_data['ph1_vec'][ev]
+
+            # R1 = RzRy(th1, ph1)
+            # v1 = (R1 @ np.array([[0],[0],[1]])).reshape(1, 3)
+
+            # or calc directly
+            # v1 = np.array([[np.sin(th1)*np.cos(ph1), np.sin(th1)*np.sin(ph1), np.cos(th1)]])
+
+            # direction vectors from dyads
+            v1 = m3n2_data['dyads1_vec'][ev, :].reshape(1, 3)   # row vector
+            v2 = m3n2_data['dyads2_vec'][ev, :].reshape(1, 3)
+
+            # params
+            s0 = m3n2_data['s0_vec'][ev]
+            f1 = m3n2_data['f1_vec'][ev]
+            f2 = m3n2_data['f2_vec'][ev]
+            dm = m3n2_data['d_vec'][ev]
+            dstd = m3n2_data['dstd_vec'][ev]
+            lm = dm
+            lR = m3n2_data['lR_vec'][ev]
+
+            # note, dst is 0 almost everywhere, so d = dm in the Anderson model...
+            # solve for lambda 1 and 2 from eq'ns in Sotiropoulus 2016
+            l1 = 3*lm/(2*lR + 1)
+            l2 = lR*l1
+
+            # then recreate the tensors and use them to calculate predicted signal
+            D1 = (l1 - l2)*v1.T @ v1 + l2*np.eye(3)
+            D2 = (l1 - l2)*v2.T @ v2 + l2*np.eye(3)
+
+            # calculate the isotropic diffusion component here to save time
+            b_i = bvals.max()
+            # assuming single-shell data here
+            assert np.all(bvals[~t2w_vols] == b_i)
+
+            iso_fac = (dm/(dm + b_i*dstd**2))**(dm**2/dstd**2)
+
+            # note there can be a problem here -- when dstd is very small (< 1e-10), floating point
+            # error in representing the fraction (dm/(dm + b_i*dstd**2)) makes it turn into
+            # 1.0; so then the isotropic term is way too high. Note that b_i*dstd**2 is not 0, though.
+            # when dstd = 6.6e-10 (ev=144), i found the difference btw the Sotirop2016 form and the
+            # Anderson 2005 equation form to be 0.03%
+            # dstd min value 1e-45 at ev=21449
+
+            # check whether the isotropic term has collapsed to 1.0
+            if (dstd < 1e-9) or (iso_fac == 1.0):
+                # use the decimal module to get added precision
+                dec_mdl_used += 1
+                dm_dec, dstd_dec, b_i_dec = map(dec.Decimal, [dm, dstd, b_i])
+
+                iso_fac = float((dm_dec/(dm_dec + b_i_dec*dstd_dec**2))**(dm_dec**2/dstd_dec**2))
+
+                if (dstd < 1e-45) or (iso_fac == 1.0):
+                    # may still need more precision
+                    raise ValueError(f"  dstd too small? {dstd} at ev={ev}, iso_fac = {iso_fac}")
+
+            l1_vec.append(l1)
+            l2_vec.append(l2)
+            params_vec.append((s0, f1, f2, dm, dstd, lm, lR, l1, l2, v1, v2, D1, D2, iso_fac))
+
+        if dec_mdl_used > 0:
+            p = 100*dec_mdl_used/n_vxls
+            print(f"  Decimal module was used {dec_mdl_used} times ({p:.2f} percent)")
+
+        # Write out images of L1 and L2
+        m3n2_L1 = np.zeros(shape_3d)
+        m3n2_L2 = np.zeros(shape_3d)
+
+        m3n2_L1[mask] = 1000.*np.array(l1_vec)     # convert units as before
+        m3n2_L2[mask] = 1000.*np.array(l2_vec)
+
+        du.make_nii(m3n2_L1, new_aff=nii.affine).to_filename(m3n2_modir + 'm3n2_L1.nii.gz')
+        du.make_nii(m3n2_L2, new_aff=nii.affine).to_filename(m3n2_modir + 'm3n2_L2.nii.gz')
+
+
+        # loop over gradient directions to calculate signal estimates
+        m3n2_sse = np.zeros(shape_3d)
+        m3n2_si_pred = np.zeros(shape_4d)
+
+        for i in range(n_obs):
+            print("  DWI images [" + "x"*(i+1) + "-"*(n_obs-i-1) + "]", end='\r')
+
+            # Operate within the mask at this index
+            si_vec = dt2wi_2d[:, i]
+
+            if t2w_vols[i]:
+                # model returns S_0 when b=0
+                si_pred = m3n2_data['s0_vec']
+
+            else:
+                r_i = bvecs[:, i].reshape(1, 3)     # row vector
+
+                b_i = bvals[i]
+
+                si_pred = np.zeros(shape_1d)
+
+                # loop over voxels in mask to do matrix multiplication
+                for ev in range(n_vxls):
+                    s0, f1, f2, dm, dstd, lm, lR, _, _, v1, v2, _, _, iso_fac = params_vec[ev]
+
+                    f1_fac = np.exp(-b_i*3*lm/(2*lR + 1)*((1 - lR)*(r_i@v1.T).item()**2 + lR))
+                    f2_fac = np.exp(-b_i*3*lm/(2*lR + 1)*((1 - lR)*(r_i@v2.T).item()**2 + lR))
+
+                    si_pred[ev] = s0*((1 - f1 - f2)*iso_fac + f1*f1_fac + f2*f2_fac)
+
+                    # or can use the Anderson style eq'n when dstd is very small
+                    # si_pred[ev] = s0*((1 - f1 - f2)*np.exp(-b_i*dm) \
+                    #                    + f1*np.exp(-b_i * (r_i @ D1 @ r_i.T).item()) \
+                    #                    + f2*np.exp(-b_i * (r_i @ D2 @ r_i.T).item()))
+
+            m3n2_si_pred[mask, i] = si_pred
+
+            sqerr = (np.log(si_pred) - np.log(si_vec))**2
+
+            # by my def'n
+            sqerr[trouble_spots[:, i]] = 1
+
+            m3n2_sse[mask] += sqerr
+
+        print("")
+
+        # calc BIC from SSE
+        # n_params = 10
+        n_params = 9    # d_std not used in 99.9% of voxels
+        m3n2_bic = np.zeros(shape_3d)
+        m3n2_bic[mask] = n_obs*np.log(m3n2_sse[mask]/n_obs) + n_params*np.log(n_obs)
+
+        du.make_nii(m3n2_sse, new_aff=nii.affine).to_filename(m3n2_modir + 'm3n2_SSE.nii.gz')
+        du.make_nii(m3n2_bic, new_aff=nii.affine).to_filename(m3n2_modir + 'm3n2_BIC.nii.gz')
+        du.make_nii(m3n2_si_pred, new_aff=nii.affine).to_filename(m3n2_modir + 'm3n2_Si_pred.nii.gz')
+
+
+    # Write out SSE and BIC values to a CSV file
+    output_csv = 'dmri_SSE_BIC.csv'
+    with open(output_csv, 'w') as outfile:
+        outfile.write("Model,SSE_WM,SSE_lin-WM,SSE_pla-WM,BIC_WM,BIC_lin-WM,BIC_pla-WM\n")
+        if run_tens:
+            outfile.write(f"Tensor-WDT,{tens_sse[wmmask].mean():.3f},{tens_sse[linwm_mask].mean():.3f},{tens_sse[plawm_mask].mean():.3f},{tens_bic[wmmask].mean():.0f},{tens_bic[linwm_mask].mean():.0f},{tens_bic[plawm_mask].mean():.0f}\n")
+        if run_m1n1:
+            outfile.write(f"M1-N1,{m1n1_sse[wmmask].mean():.3f},{m1n1_sse[linwm_mask].mean():.3f},{m1n1_sse[plawm_mask].mean():.3f},{m1n1_bic[wmmask].mean():.0f},{m1n1_bic[linwm_mask].mean():.0f},{m1n1_bic[plawm_mask].mean():.0f}\n")
+        if run_m1n2:
+            outfile.write(f"M1-N2,{m1n2_sse[wmmask].mean():.3f},{m1n2_sse[linwm_mask].mean():.3f},{m1n2_sse[plawm_mask].mean():.3f},{m1n2_bic[wmmask].mean():.0f},{m1n2_bic[linwm_mask].mean():.0f},{m1n2_bic[plawm_mask].mean():.0f}\n")
+        if run_m3n1:
+            outfile.write(f"M3-N1,{m3n1_sse[wmmask].mean():.3f},{m3n1_sse[linwm_mask].mean():.3f},{m3n1_sse[plawm_mask].mean():.3f},{m3n1_bic[wmmask].mean():.0f},{m3n1_bic[linwm_mask].mean():.0f},{m3n1_bic[plawm_mask].mean():.0f}\n")
+        if run_m3n2:
+            outfile.write(f"M3-N2,{m3n2_sse[wmmask].mean():.3f},{m3n2_sse[linwm_mask].mean():.3f},{m3n2_sse[plawm_mask].mean():.3f},{m3n2_bic[wmmask].mean():.0f},{m3n2_bic[linwm_mask].mean():.0f},{m3n2_bic[plawm_mask].mean():.0f}\n")
+
+
+    # Model plots
+
+    def calc_x(v):
+        '''calculate x for plotting; pass a cartesian unit vector'''
+
+        x = np.zeros(n_obs)
+        for i in range(n_obs):
+            r_i = bvecs[:, i]
+
+            x[i] = np.dot(r_i, v)    # cos(Delta)
+
+        sk = np.argsort(x**2)  # sort-key for plotting
+        # print(f"sortkey: {sk}")
+
+        return x, sk
+
+
+    def logplot_si(v1, y, yi, vox_str, mdl_str):
+        '''plot signal against cos^2(delta) for a particular model'''
+
+        fig, ax = plt.subplots(# nrows=1, ncols=2,
+                               # sharex=True,
+                               figsize=(7.0, 3.5),
+                               dpi=150)
+
+        x, sk = calc_x(v1)
+
+        ax.plot(x[sk]**2, yi[sk], 'ko')
+        ax.plot(x[sk]**2, y[sk], '-')
+        ax.set_yscale('log')           # semi-log plot
+        ax.set_xlim([-0.05, 1.05])
+        # ymin, ymax = ax.get_ylim()
+        # ax.set_ylim([100, ymax])
+
+        ax.set_ylabel(r"dMRI Signal")
+        ax.set_xlabel(r"$\cos^2(\Delta)$ = $\left(\vec{r_i} \bullet \vec{v_1}\right)^2$")
+
+        fig.savefig(mfp_dir + f'logplot-{vox_str}_{mdl_str}.pdf')
+        plt.close(fig)
+
+
+    def calc_tens(params):
+        """calculate tensor model predicted values at grid locations"""
+
+        s0, l1, l2, l3, v1, v2, v3 = params
+
+        b=1.    # not 1000, to match lambdas
+        xx, yy, zz = np.meshgrid(np.arange(-1,1,0.05), np.arange(-1,1,0.05), np.arange(0,1,0.05))
+        x1_arr = []
+        x2_arr = []
+        x3_arr = []
+        si_pred = []
+        for i in range(np.prod(xx.shape)):
+
+            g = np.array([xx.ravel()[i], yy.ravel()[i], zz.ravel()[i]])
+
+            x1 = np.dot(g, v1)
+            x2 = np.dot(g, v2)
+            x3 = np.dot(g, v3)
+
+            x1_arr.append(x1)
+            x2_arr.append(x2)
+            x3_arr.append(x3)
+
+            si_pred.append(s0*np.exp(-b*(l1*x1**2 + l2*x2**2 + l3*x3**2)))
+
+        si_pred = np.array(si_pred)
+        x1_arr = np.array(x1_arr)
+        x2_arr = np.array(x2_arr)
+        x3_arr = np.array(x3_arr)
+
+        # # where b=0
+        # try:
+        #     si_pred[0, 0] = s0
+        # except TypeError:       # 'numpy.float64' object does not support item assignment
+        #     # passed elements were not x1grid, but may be scalars
+        #     if (np.prod(si_pred.shape) == 1) and not np.isscalar(si_pred):
+        #         si_pred = si_pred.item()
+
+        return si_pred, x1_arr, x2_arr
+
+
+    # def surfplot_tens(params, x1, x2, sk, yi, vox_str, mdl_str):
+
+    #     fig = plt.figure(figsize=(7.0, 3.5),
+    #                      dpi=150)
+
+    #     ax = fig.add_subplot(111, projection='3d')
+    #     ax.view_init(15, 45)
+
+    #     Sgrid, x1_arr, x2_arr = calc_tens(params)
+
+
+    def calc_m1n2(s0, f1, f2, d, x1, x2):
+        """calculate m1n2 model predicted values at grid locations"""
+
+        b=1000
+        si_pred = s0*((1 - f1 - f2)*np.exp(-b * d) \
+                      + f1*np.exp(-b * d * x1**2)
+                      + f2*np.exp(-b * d * x2**2))
+
+        # where b=0
+        try:
+            si_pred[0, 0] = s0
+        except TypeError:       # 'numpy.float64' object does not support item assignment
+            # passed elements were not x1grid, but may be scalars
+            if (np.prod(si_pred.shape) == 1) and not np.isscalar(si_pred):
+                si_pred = si_pred.item()
+
+        return si_pred
+
+
+    def surfplot_si(params, x1, x2, sk, yi, vox_str, mdl_str):
+
+        fig = plt.figure(figsize=(7.0, 3.5),
+                         dpi=150)
+
+        ax = fig.add_subplot(111, projection='3d')
+        ax.view_init(15, 45)
+
+        # surface from model params
+        x1grid, x2grid = np.meshgrid(np.arange(0., 1.05, 0.05), np.arange(0., 1.05, 0.05))
+
+        if mdl_str == 'WDT':
+            Sgrid, x1_arr, x2_arr = calc_tens(params)
+
+            import ipdb; ipdb.set_trace()
+
+            cbmin = np.floor(10*np.log10(Sgrid.min()))/10.
+            cbmax = np.ceil(10*np.log10(Sgrid.max()))/10.
+
+            ax.plot_surface(x1_arr**2, x2_arr**2, np.log10(Sgrid),
+                        cmap='Greens', vmin=cbmin, vmax=cbmax,
+                        antialiased=True, alpha=0.67, zorder=1)
+
+
+        elif mdl_str == 'BSS1':
+            s0, f1, f2, d = params
+            Sgrid = calc_m1n2(s0, f1, f2, d, x1grid, x2grid)
+        else:
+            raise NotImplementedError
+
+
+
+        cbmin = np.floor(10*np.log10(Sgrid.min()))/10.
+        cbmax = np.ceil(10*np.log10(Sgrid.max()))/10.
+        ax.plot_surface(x1grid**2, x2grid**2, np.log10(Sgrid),
+                        cmap='Greens', vmin=cbmin, vmax=cbmax,
+                        antialiased=True, alpha=0.67, zorder=1)
+
+        # # z-axis ticks as if it's a log scale
+        # import matplotlib.ticker as mticker
+        # def log_tick_formatter(val, pos=None):
+        #     return "{:.2e}".format(10**val)
+
+        # ax.zaxis.set_major_formatter(mticker.FuncFormatter(log_tick_formatter))
+
+        # points
+        # plot individually to put them "above" or "below" the surface?
+        ax.scatter3D(x1[sk]**2, x2[sk]**2, np.log10(yi[sk]), c=np.log10(yi[sk]),
+                     depthshade=False, edgecolors='k', linewidths=0.75, s=3**2,
+                     cmap='Greens', vmin=cbmin, vmax=cbmax, zorder=2)
+
+        # vertical stems from the surface to the points
+        zlims = ax.get_zlim3d()
+        for xx, yy, zz in zip(x1[sk], x2[sk], yi[sk]):
+            if (xx < 0.01) and (yy < 0.01):
+                # skip t2w points
+                continue
+
+            # calculate surface height at data point location
+            if mdl_str == 'BSS1':
+                surfh = calc_m1n2(s0, f1, f2, d, xx, yy)
+
+            ax.plot([xx**2, xx**2],[yy**2, yy**2],[np.log10(surfh), np.log10(zz)], 'k-', lw=1.0, alpha=0.5)
+
+            # import ipdb; ipdb.set_trace()
+
+        ax.set_zlim3d(bottom=zlims[0], top=zlims[1])
+
+        ax.set_xlabel(r"$\cos^2(\Delta_1)$ = $\left(\vec{r_i} \bullet \vec{v_1}\right)^2$")
+        ax.set_ylabel(r"$\cos^2(\Delta_2)$ = $\left(\vec{r_i} \bullet \vec{v_2}\right)^2$")
+        ax.set_zlabel(r'log$_{10}$(dMRI Signal)')
+
+        fig.savefig(mfp_dir + f'surfplot-{vox_str}_{mdl_str}.pdf')
+        plt.close(fig)
+
+
+    # Make model fit plots for select voxels
+    mfp_dir = 'model_fit_plots/'
+    vxls = {}
+    vxls['lin_anis'] = (49, 39, 26)     # linear anisotropic
+    vxls['plan_anis'] = (61, 50, 30)    # planar anisotropic
+    vxls['CSFxCC'] = (42, 39, 26)       # at the boundary of CSF and CC, with elevated RD for BZZ
+    vxls['typ_anis'] = (56, 56, 26)     # more typical WM
+
+    for vox_str, ev in vxls.items():
+
+        yi = dt2wi_data[ev[0], ev[1], ev[2], :]     # measured signal
+
+        # tensor model
+        if run_tens:
+
+            y = tens_si_pred[ev[0], ev[1], ev[2], :]    # pred signal
+
+            v1_nii = du.check_load_nii(tens_modir + tens_modir[0:3] + '_V1.nii.gz') # each voxel gets 3 values for x,y,z component
+            v1_data = v1_nii.get_fdata()
+            v1 = v1_data[ev[0], ev[1], ev[2], :]        # 1st eigenvector
+
+            logplot_si(v1, y, yi, vox_str, 'wdt')
+
+
+            v2_nii = du.check_load_nii(tens_modir + tens_modir[0:3] + '_V2.nii.gz') # each voxel gets 3 values for x,y,z component
+            v2_data = v2_nii.get_fdata()
+            v2 = v2_data[ev[0], ev[1], ev[2], :]        # 2nd eigenvector
+
+            v3_nii = du.check_load_nii(tens_modir + tens_modir[0:3] + '_V3.nii.gz') # each voxel gets 3 values for x,y,z component
+            v3_data = v3_nii.get_fdata()
+            v3 = v3_data[ev[0], ev[1], ev[2], :]        # 3rd eigenvector
+
+            # Dxx, Dxy, Dxz, Dyy, Dyz, Dzz = tens_data[ev[0], ev[1], ev[2], :]
+
+            # Deff = np.array([[Dxx, Dxy, Dxz],
+            #                  [Dxy, Dyy, Dyz],
+            #                  [Dxz, Dyz, Dzz]])
+
+            s0_nii = du.check_load_nii(tens_modir + tens_modir[0:3] + '_S0.nii.gz')
+            s0_data = s0_nii.get_fdata()
+            s0 = s0_data[ev[0], ev[1], ev[2]]
+
+            l1_nii = du.check_load_nii(tens_modir + tens_modir[0:3] + '_L1.nii.gz')
+            l1_data = l1_nii.get_fdata()
+            l1 = l1_data[ev[0], ev[1], ev[2]]
+
+            l2_nii = du.check_load_nii(tens_modir + tens_modir[0:3] + '_L2.nii.gz')
+            l2_data = l2_nii.get_fdata()
+            l2 = l2_data[ev[0], ev[1], ev[2]]
+
+            l3_nii = du.check_load_nii(tens_modir + tens_modir[0:3] + '_L3.nii.gz')
+            l3_data = l3_nii.get_fdata()
+            l3 = l3_data[ev[0], ev[1], ev[2]]
+
+            x1, _ = calc_x(v1)
+            x2, _ = calc_x(v2)
+
+            sk = np.argsort(x1**2 + x2**2)
+
+            surfplot_si((s0, l1, l2, l3, v1, v2, v3), x1, x2, sk, yi, vox_str, 'WDT')
+
+
+        # ----------
+        # m1n1 model
+        if run_m1n1:
+
+            y = m1n1_si_pred[ev[0], ev[1], ev[2], :]    # pred signal
+
+            dyads1 = m1n1_data['dyads1_data'][ev[0], ev[1], ev[2], :]   # 1st stick eigenvector
+
+            logplot_si(dyads1, y, yi, vox_str, 'BS1')
+
+        # ----------
+        # m1n2 model
+        if run_m1n2:
+
+            y = m1n2_si_pred[ev[0], ev[1], ev[2], :]    # pred signal
+
+            dyads1 = m1n2_data['dyads1_data'][ev[0], ev[1], ev[2], :]
+            dyads2 = m1n2_data['dyads2_data'][ev[0], ev[1], ev[2], :]
+
+            logplot_si(dyads1, y, yi, vox_str, 'BSS1')
+
+            s0 = m1n2_data['s0_data'][ev[0], ev[1], ev[2]]
+            f1 = m1n2_data['f1_data'][ev[0], ev[1], ev[2]]
+            f2 = m1n2_data['f2_data'][ev[0], ev[1], ev[2]]
+            d = m1n2_data['d_data'][ev[0], ev[1], ev[2]]
+
+            x1, _ = calc_x(dyads1)
+            x2, _ = calc_x(dyads2)
+
+            sk = np.argsort(x1**2 + x2**2)
+
+            surfplot_si((s0, f1, f2, d), x1, x2, sk, yi, vox_str, 'BSS1')
+
+        # ----------
+        # m3n1 model
+        if run_m3n1:
+
+            y = m3n1_si_pred[ev[0], ev[1], ev[2], :]    # pred signal
+
+            dyads1 = m3n1_data['dyads1_data'][ev[0], ev[1], ev[2], :]
+
+            logplot_si(dyads1, y, yi, vox_str, 'BZ')
+
+        # ----------
+        # m3n2 model
+        if run_m3n2:
+
+            y = m3n2_si_pred[ev[0], ev[1], ev[2], :]    # pred signal
+
+            dyads1 = m3n2_data['dyads1_data'][ev[0], ev[1], ev[2], :]
+            dyads2 = m3n2_data['dyads2_data'][ev[0], ev[1], ev[2], :]
+
+            logplot_si(dyads1, y, yi, vox_str, 'BZZ')
+
+        # note noise level in UCA subj is ~ 40
+
+        # note wiggly plots: maybe just because of multiple fibres
+        # 3D: plot against v1 and v2
+
+    import ipdb; ipdb.set_trace()
+    return
+
+
+    # surf...
+
+
+    # Countour plot to represent Z
+    fig, ax = plt.subplots(constrained_layout=True)
+
+    # contour levels for the model
+    cs = ax.contourf(x1grid**2, x2grid**2, np.log10(Sgrid), levels=25,
+                     vmin=cbmin, vmax=cbmax, zorder=1, cmap='gray')     # 'viridis' by default
+
+    # scatter points for the measurements
+    pths = ax.scatter(x1[sk]**2, x2[sk]**2, c=np.log10(yi[sk]), s=32., linewidths=0.5,
+                      vmin=cbmin, vmax=cbmax, zorder=2, edgecolors='0.9', cmap='gray')
+
+    cb = fig.colorbar(pths, ax=ax)
+    # cb.set_label
+
+    ax.set_xlim([-0.0, 1.0])
+    ax.set_ylim([-0.0, 1.0])
+
+    ax.set_xlabel(r"$\cos^2(\Delta_1)$ = $\left(\vec{r_i} \bullet \vec{v_1}\right)^2$")
+    ax.set_ylabel(r"$\cos^2(\Delta_2)$ = $\left(\vec{r_i} \bullet \vec{v_2}\right)^2$")
+
+    ax.set_title(r"log$_{10}$(dMRI Signal) with M1-N2 model")
+
+    fig.savefig(mfp_dir + f'countourplot-{vox_str}_m1n2.png', dpi=600)
+
+
+if __name__ == '__main__':
+    main(False, False, True, False, False)
+

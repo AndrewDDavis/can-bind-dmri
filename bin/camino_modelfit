@@ -1,0 +1,424 @@
+#!/bin/bash
+
+# v0.2.2 (Aug 2019) by Andrew Davis (addavis@gmail.com)
+
+function print_doc {
+cat << EOF
+
+$(basename $0)
+-----------
+
+Preprocess motion-corrected DWI data to fit a tensor and calculate eigenvalues,
+FA, etc with Camino. Alternatively, fit a non-tensor model, such as ball-stick.
+
+By default operates in sub-directory 'camino' with restore
+algorithm.
+
+Recommended Docs:
+- http://camino.cs.ucl.ac.uk/index.php?n=Tutorials.WMAnalyticModels
+- http://camino.cs.ucl.ac.uk/index.php?n=Man.Modelfit
+- the paper: Panagiotaki, 2012
+
+Requires:
+- Camino
+
+Options:
+    --cam-dir <dir>  : directory containing camino output files
+    --model <str>    : model to fit.
+                       Possible values for tensor inversion:
+                         - ldt
+                         - restore
+                         - ldt_wtd
+                       Other inversions:
+                         - cylcyl
+                       WM Analytical Models:
+                         - BallStick
+                         - BallCylinder
+                         - etc.
+
+Outputs:
+    {cam-dir}/dmri-{model}_* : nifti files for eigenvalues, FA, etc.
+
+EOF
+}
+
+# Find Camino
+if [[ -z "$CAMINODIR" ]]; then
+    pth="$(which estimatesnr)"
+    export CAMINODIR="${pth%/bin/estimatesnr}"
+fi
+
+# Robust options
+set -o nounset
+set -o errexit
+set -o pipefail
+shopt -s nullglob
+
+# Defaults
+cam_dir=camino  # relative to current dir
+model=restore
+
+# Parse args
+[[ $1 == -h ]] || [[ $1 == --help ]] && { print_doc; exit 0; }
+while [ $# -gt 0 ]; do
+    case $1 in
+      --cam-dir ) cam_dir="$2"; shift;;
+        --model ) model="$2"; shift;;
+              * ) echo "Unrecognized option '$1'"; print_doc; exit 1;;
+    esac
+    shift
+done
+
+# Check for expected files
+[[ -d "$cam_dir" ]] || /bin/mkdir -p "$cam_dir"
+
+# new naming scheme of dmripp; formerly used dtipp files
+schemefile="${cam_dir}/dwi_stdpp.scheme"
+if [[ ! -e "$schemefile" ]]; then
+    echo "Creating scheme file $schemefile"
+    $CAMINODIR/bin/fsl2scheme \
+        -bvecfile "${cam_dir}"/../dwi_stdpp.bvec \
+        -bvalfile "${cam_dir}"/../dwi_stdpp.bval \
+        > "$schemefile"
+fi
+
+inputdwi="${cam_dir}"/../dwi_stdpp.nii.gz       # used to be dwi_merged-ecc
+[[ -e "$inputdwi" ]] || { echo "Error: dwi_stdpp.nii.gz not found in ${cam_dir}/.."; exit 2; }
+
+bgmask="${cam_dir}"/../mask-rough_brain.nii.gz  # used to be t2w_epi_mean-brain_mask.nii.gz
+[[ -e "$bgmask" ]] || { echo "Error: mask-rough_brain.nii.gz not found in ${cam_dir}/.."; exit 2; }
+
+
+# Set model-specific arguments
+if [[ $model == ldt ]]; then
+
+    model_type=tensor
+    model_args=(-model $model)
+
+elif [[ $model == restore ]]; then
+
+    # See `man restore`
+    # For _restore_, exit codes > 1000 indicate the number of outliers ignored in the fit
+    # (no. outliers = EC - 1000).
+    model_type=tensor
+    # see `more bgstats_out.txt`, choose value from DWI in E(S^2)
+    es2=9.096376E02
+    noise_sigma=$(python -c "import math; print math.sqrt(0.5*${es2})")
+    model_args=(-model $model -sigma $noise_sigma -outliermap ${model}_outliers.Bbyte)
+
+elif [[ $model == ldt_wtd ]]; then
+
+    model_type=tensor
+    model_args=(-model $model -noisemap ${model}_noise.Bdouble)
+
+elif [[ $model == cylcyl ]]; then
+
+    # See `man multitenfit`
+    model_type=dual_tensor
+    model_args=(-model $model ldt)
+
+elif [[ $model == ball_stick ]]; then
+
+    echo "ball_stick is deprecated. Use BallStick instead."
+    exit 1
+
+elif [[ $model == BallStick ]]; then
+
+    model_type=wma      # white matter analytical
+    model_args=(-fitmodel $model -fitalgorithm LM)
+
+else
+
+    echo "Unrecognized model: $model. Treating as WMA."
+    model_type=wma
+    model_args=(-fitmodel $model -fitalgorithm LM)
+
+fi
+
+
+# Fit model and convert output to nifti
+# Note on checking components: Bdouble file is 38,486,016 bytes on disk from the
+# BallStick model. For 8-byte double precision float values and a 96x96x58 image,
+# this gives 38,486,016/(8*96*96*58) = 9 components.
+printf "\nRunning modelfit (${model_args[*]}) with scheme file ${schemefile}\n"
+model_outputfile="${cam_dir}"/${model}_result.Bdouble
+$CAMINODIR/bin/modelfit -inputfile "$inputdwi" \
+                        -schemefile "$schemefile" \
+                        "${model_args[@]}" \
+                        -bgmask "$bgmask" \
+                        -outputfile "$model_outputfile" \
+                        -outputdatatype double \
+
+fsize=$(stat --format='%s' "$model_outputfile")   # 34209792 for tensor
+dim1=$($FSLDIR/bin/fslval "$inputdwi" dim1 | tr -d '[:blank:]')
+dim2=$($FSLDIR/bin/fslval "$inputdwi" dim2 | tr -d '[:blank:]')
+dim3=$($FSLDIR/bin/fslval "$inputdwi" dim3 | tr -d '[:blank:]')
+ncomp=$(python -c "print(${fsize}./(8*${dim1}*${dim2}*${dim3}))")  # 8.0 for tensor; 9.0 for BallStick
+printf "\nFit complete: $model model output $ncomp components.\n\n"
+
+$CAMINODIR/bin/voxel2image -components $(printf '%.0f' $ncomp) \
+                           -inputdatatype double -outputdatatype float \
+                           -inputfile "$model_outputfile" \
+                           -outputroot "${cam_dir}"/${model}_rescomp_ \
+                           -header "$inputdwi"
+
+# parse outputs
+echo "Parsing $model outputs"
+$FSLDIR/bin/immv "${cam_dir}"/${model}_rescomp_0001 "${cam_dir}"/dmri-${model}_EC
+
+if [[ $model_type == tensor ]]; then
+
+    # Tensors all output 8 components:
+    # EC, ln(S0), D_xx, D_xy, D_xz, D_yy, D_yz, D_zz
+    #  1     2      3     4     5     6     7     8
+    $FSLDIR/bin/fslmaths "${cam_dir}"/${model}_rescomp_0002 \
+                         -exp \
+                         "${cam_dir}"/dmri-${model}_S0 \
+      && /bin/rm "${cam_dir}"/${model}_rescomp_0002.nii.gz
+
+    $FSLDIR/bin/fslmerge -t "${cam_dir}"/dmri-${model}_tensor-upper \
+                         "${cam_dir}"/${model}_rescomp_000[3-8].nii.gz \
+      && /bin/rm "${cam_dir}"/${model}_rescomp_000[3-8].nii.gz
+
+    # Now run dteig on ${model}_result.Bdouble
+    # For each tensor the program outputs: {l_1, e_11, e_12, e_13,
+    #                                       l_2, e_21, e_22, e_33,
+    #                                       l_3, e_31, e_32, e_33},
+    # where l_1 >= l_2 >= l_3 and e_i = (e_i1, e_i2, e_i3) is the eigenvector
+    # with eigenvalue l_i
+    $CAMINODIR/bin/dteig -inputmodel dt \
+                         -inputdatatype double -outputdatatype double \
+                         < "$model_outputfile" \
+                         > "${cam_dir}"/${model}_eigensystem.Bdouble
+
+    $CAMINODIR/bin/voxel2image -components 12 \
+                               -inputdatatype double -outputdatatype float \
+                               -inputfile "${cam_dir}"/${model}_eigensystem.Bdouble \
+                               -outputroot "${cam_dir}"/${model}_eigensystem_ \
+                               -header "$inputdwi"
+
+    for i in 1 5 9; do
+        [[ $i -eq 1 ]] && { j=1; k='0][2-4'; }
+        [[ $i -eq 5 ]] && { j=2; k='0][6-8'; }
+        [[ $i -eq 9 ]] && { j=3; k='1][0-2'; }
+        $FSLDIR/bin/immv "${cam_dir}"/${model}_eigensystem_000${i} "${cam_dir}"/dmri-${model}_L${j}
+        $FSLDIR/bin/fslmerge -t "${cam_dir}"/dmri-${model}_V${j} \
+                             "${cam_dir}"/${model}_eigensystem_00[$k].nii.gz
+    done
+
+    /bin/rm "${cam_dir}"/${model}_eigensystem_00[01][0-8].nii.gz \
+            "${cam_dir}"/${model}_eigensystem.Bdouble
+
+
+    # FA
+    $CAMINODIR/bin/fa -inputmodel dt \
+                      -inputdatatype double -outputdatatype double \
+                      < "$model_outputfile" \
+                      > "${cam_dir}"/${model}_FA.Bdouble
+
+    $CAMINODIR/bin/voxel2image -components 1 \
+                               -inputdatatype double -outputdatatype float \
+                               -inputfile "${cam_dir}"/${model}_FA.Bdouble \
+                               -outputroot "${cam_dir}"/dmri-${model}_FA \
+                               -header "$inputdwi" \
+      && /bin/rm "${cam_dir}"/${model}_FA.Bdouble
+
+
+    # MD
+    $CAMINODIR/bin/md -inputmodel dt \
+                      -inputdatatype double -outputdatatype double \
+                      < "$model_outputfile" \
+                      > "${cam_dir}"/${model}_MD.Bdouble
+
+    $CAMINODIR/bin/voxel2image -components 1 \
+                               -inputdatatype double -outputdatatype float \
+                               -inputfile "${cam_dir}"/${model}_MD.Bdouble \
+                               -outputroot "${cam_dir}"/dmri-${model}_MD \
+                               -header "$inputdwi" \
+      && /bin/rm "${cam_dir}"/${model}_MD.Bdouble
+
+
+    # Frobenius Norm
+    dti_calc_frobnorm --prep_dir "${cam_dir}" --fbn dmri-${model}
+
+
+    # Scale diffusivity values to um^2/ms
+    # Didn't want to scale the tensors in case that messes with later tracking
+    for s in MD L1 L2 L3 FrobNorm; do
+        $FSLDIR/bin/fslmaths "${cam_dir}"/dmri-${model}_${s} \
+                             -mul 1E9 \
+                             "${cam_dir}"/dmri-${model}_${s}
+    done
+
+
+    # Calculate RD, MoA
+    dti_calc_RD --prep_dir "${cam_dir}" --fbn dmri-${model}
+
+    # MoA with voxelclassify ...
+
+    # mask with valid mask using EC
+
+
+elif [[ $model_type == dual_tensor ]]; then
+
+    # Dual-Tensors all output 17 components:
+    # EC, ln(S0), N, a_1, D_1xx, D_1xy, D_1xz, D_1yy, D_1yz, D_1zz, a_2, D_2xx, D_2xy, D_2xz,  D_2yy,  D_2yz,  D_2zz
+    #  1     2    3   4     5      6      7      8      9      10    11    12     13     14      15      16      17
+    $FSLDIR/bin/fslmaths "${cam_dir}"/${model}_rescomp_0002 \
+                         -exp \
+                         "${cam_dir}"/dmri-${model}_S0 \
+      && /bin/rm "${cam_dir}"/${model}_rescomp_0002.nii.gz
+
+    $FSLDIR/bin/fslmerge -t "${cam_dir}"/dmri-${model}_tensor1-upper \
+                         "${cam_dir}"/${model}_rescomp_00{0[5-9],10}.nii.gz \
+      && /bin/rm "${cam_dir}"/${model}_rescomp_00{0[5-9],10}.nii.gz
+
+    $FSLDIR/bin/fslmerge -t "${cam_dir}"/dmri-${model}_tensor2-upper \
+                         "${cam_dir}"/${model}_rescomp_001[2-7].nii.gz \
+      && /bin/rm "${cam_dir}"/${model}_rescomp_001[2-7].nii.gz
+
+    /bin/mv "${cam_dir}"/${model}_rescomp_0003.nii.gz "${cam_dir}"/dmri-${model}_N.nii.gz
+    /bin/mv "${cam_dir}"/${model}_rescomp_0004.nii.gz "${cam_dir}"/dmri-${model}_a1.nii.gz
+    /bin/mv "${cam_dir}"/${model}_rescomp_0011.nii.gz "${cam_dir}"/dmri-${model}_a2.nii.gz
+
+# elif [[ $model_type == bs_inversion ]]; then
+
+#     # Ball-Stick by inversion generates 7 components:
+#     # EC, ln(S(0)), d, f, vx, vy, vz
+#     #  1      2     3  4   5   6   7
+#     fslmaths "${cam_dir}"/${model}_rescomp_0002 -exp "${cam_dir}"/dmri-${model}_S0 \
+#       && /bin/rm "${cam_dir}"/${model}_rescomp_0002.nii.gz
+
+#     /bin/mv "${cam_dir}"/${model}_rescomp_0003.nii.gz "${cam_dir}"/dmri-${model}_d.nii.gz
+#     /bin/mv "${cam_dir}"/${model}_rescomp_0004.nii.gz "${cam_dir}"/dmri-${model}_f.nii.gz
+
+#     fslmerge -t "${cam_dir}"/dmri-${model}_V "${cam_dir}"/${model}_rescomp_000[5-7].nii.gz \
+#       && /bin/rm "${cam_dir}"/${model}_rescomp_000[5-7].nii.gz
+
+elif [[ $model_type == wma ]]; then
+
+    # To [interpret output](http://camino.cs.ucl.ac.uk/index.php?n=Tutorials.WMAnalyticModels):
+    # 1. Exit code: 0 = OK, -1 = background, anything else indicates a problem
+    # 2. S0
+    # 3. Intra-axonal volume fraction f1, which is always the f of the second name in the
+    #    multi-compartment model, e.g. in ZeppelinCylinder f1 is the Cylinder's volume fraction
+    # 4. Extra-axonal f2 is the f of the first name in the multi-compartment model, e.g. in the
+    #    ZeppelinCylinder f2 is the Zeppelin's f
+    # 5. Third compartment's f3, which is always the last name in the name of the multi-compartment
+    #    model, e.g. ZeppelinCylinderSphere f3 is the Sphere's f.
+    # 6. Then we put in order the parameters of the intra-axonal compartment, then the parameters
+    #    of the extra-axonal compartment and then the parameters of the isotropic restriction
+    #    compartment. Last comes always the objective function. For component parameters, see
+    #    [this doc](http://camino.cs.ucl.ac.uk/index.php?n=Tutorials.SynthAnalyticModels#toc1).
+
+    cd "${cam_dir}"
+
+    # Mask for valid results: exit code of 0
+    validmask=dmri-${model}_validmask
+    $FSLDIR/bin/fslmaths dmri-${model}_EC \
+                         -add 1 -thr 0.5 -uthr 1.5 -bin \
+                         $validmask \
+                         -odt char
+
+    # First few and last outputs are the same across models
+    $FSLDIR/bin/immv ${model}_rescomp_0002 dmri-${model}_S0
+
+    # Stick/Ball fractions
+    $FSLDIR/bin/fslmaths ${model}_rescomp_0003 \
+                         -mul $validmask \
+                         dmri-${model}_f1 \
+                         -odt float \
+      && imrm ${model}_rescomp_0003
+
+    $FSLDIR/bin/fslmaths ${model}_rescomp_0004 \
+                         -mul $validmask \
+                         dmri-${model}_f2 \
+                         -odt float \
+      && imrm ${model}_rescomp_0004
+
+    # The rest -- objective function is last
+    rescomp_arr=($(find * -name "${model}_rescomp_00[0-9][0-9].nii.gz"))
+    $FSLDIR/bin/immv ${rescomp_arr[-1]} dmri-${model}_obj
+
+
+    if [[ $model == BallStick ]]; then
+
+        # BallStick outputs: 9 components (note 5 and 8 are identical)
+        # EC, S0, f1, f2, d1, theta, phi, d2, obj
+        #  1   2   3   4   5    6     7    8   9
+        $FSLDIR/bin/immv ${model}_rescomp_0005 dmri-${model}_d1
+        $FSLDIR/bin/immv ${model}_rescomp_0006 dmri-${model}_ang_theta
+        $FSLDIR/bin/immv ${model}_rescomp_0007 dmri-${model}_ang_phi
+        $FSLDIR/bin/immv ${model}_rescomp_0008 dmri-${model}_d2
+
+        # Diffusivity
+        # There is only one D in the model; d1 and d2 should be identical
+        diff dmri-${model}_d1.nii.gz dmri-${model}_d2.nii.gz \
+          && $FSLDIR/bin/imrm dmri-${model}_d2 \
+          && $FSLDIR/bin/immv dmri-${model}_d1 dmri-${model}_d
+
+        # The values for d come out in mm^2/s (values around 10^-3), whereas the
+        # diffusion length of water at 37 degC is 3E-3 mm^2/s = 3 um^2/ms. So
+        # multiply by 1E3 to get easier to use values. But first threshold and zero
+        # out nan values and those above 1E-2 (where fitting presumably failed):
+        $FSLDIR/bin/fslmaths dmri-${model}_d \
+                             -nan -mul dmri-${model}_validmask \
+                             -uthr 1E-2 -mul 1E3 \
+                             dmri-${model}_d \
+                             -odt float
+    fi
+
+
+    # N.B. the following models did not work well, so their code was trimmed to save space
+
+    # ZeppelinStick outputs: 12 components (note 5 and 8 are identical)
+    # EC, S0, f1, f2, d1, theta1, phi1, d2, theta2, phi2, d_perp, obj
+    #  1   2   3   4   5     6      7    8     9     10     11     12
+
+    # Bizeppelin outputs: 13 components
+    # EC, S0, f1, f2, d1, theta1, phi1, d1_perp, d2, theta2, phi2, d2_perp, obj
+    #  1   2   3   4   5     6      7      8      9    10     11      12     13
+
+    # BallStickDot outputs: 10 components
+    # EC, S0, f1, f2, f3, d1, theta, phi, d2, obj
+    #  1   2   3   4   5   6    7     8    9   10
+
+    # ZeppelinStickDot outputs: 13 components
+    # EC, S0, f1, f2, f3, d1, theta1, phi1, d2, theta2, phi2, d_perp, obj
+    #  1   2   3   4   5   6     7      8    9    10     11     12     13
+
+    cd - >/dev/null
+fi
+
+[[ $model_type != dual_tensor ]] && /bin/rm "$model_outputfile"
+
+
+# Process special output files from RESTORE and WLS
+if [[ -e "${cam_dir}"/${model}_outliers.Bbyte ]]; then
+
+    fsize=$(stat --format='%s' "${cam_dir}/${model}_outliers.Bbyte")   # 16570368
+    ncomp=$(python -c "print(${fsize}./(1*${dim1}*${dim2}*${dim3}))")  # 31.0
+    $CAMINODIR/bin/voxel2image -components $(printf '%.0f' $ncomp) \
+                               -inputdatatype byte -outputdatatype byte \
+                               -inputfile "${cam_dir}"/${model}_outliers.Bbyte \
+                               -outputroot "${cam_dir}"/${model}_resoutl_ \
+                               -header "$inputdwi"
+
+    $FSLDIR/bin/fslmerge -t "${cam_dir}"/dmri-${model}_outliers \
+                         "${cam_dir}"/${model}_resoutl_0* \
+      && /bin/rm "${cam_dir}"/${model}_outliers.Bbyte "${cam_dir}"/${model}_resoutl_0*
+
+    $FSLDIR/bin/fslmaths "${cam_dir}"/dmri-${model}_outlier \
+                         -Tmean \
+                         "${cam_dir}"/dmri-${model}_outlier_mean
+
+elif [[ -e "${cam_dir}"/${model}_noise.Bdouble ]]; then
+
+    $CAMINODIR/bin/voxel2image -components 1 \
+                               -inputdatatype double -outputdatatype float \
+                               -inputfile "${cam_dir}"/${model}_noise.Bdouble \
+                               -outputroot "${cam_dir}"/dmri-${model}_noise \
+                               -header "$inputdwi" \
+      && /bin/rm "${cam_dir}"/${model}_noise.Bdouble
+fi
+

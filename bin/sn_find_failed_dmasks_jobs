@@ -1,0 +1,34 @@
+#!/bin/bash
+
+# Run from CB_DTI/ on Graham
+
+if [[ $1 == --del ]]; then
+    del=True
+else
+    del=False
+fi
+
+for f in $(find data/subprojects/ -wholename '*/*/dwi_dmasks-[0-9]*.out' | sort); do
+
+    d=$(dirname $f)
+
+    if [[ $(stat -c %s $f) -gt 0 ]] \
+       && grep error $f > /dev/null \
+       && [[ ! -e $d/dwi_dmasks ]]; then
+
+        if [[ $del == True ]]; then
+            echo "removing $f"
+            rm $f
+
+        elif grep 'DUE TO TIME LIMIT' $f > /dev/null; then
+            # always delete over-time ones
+            echo "removing $f (TIME LIMIT)"
+            rm $f
+
+        else
+            echo "Checking ${f}:"
+            head -5 $f
+            echo ""
+        fi
+    fi
+done

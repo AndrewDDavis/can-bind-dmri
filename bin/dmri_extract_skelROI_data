@@ -17,7 +17,7 @@ cat << EOF
 
     Arguments
     ---------
-      - visit_code: cohort to use; one of {1,12,13,123}
+      - visit_code: cohort to use; one of {1,2,123}
       - metric: type of data; one of {FA, MD, etc}
 
 EOF
@@ -43,7 +43,7 @@ gr_res_dir=${proj_dir}/group_results
 [[ $# -eq 2 ]] || { scriptEcho -e "expected 2 args."; exit 2; }
 
 vis_code=$1 && shift
-[[ $vis_code == 1 || $vis_code == 12 || $vis_code == 13 || $vis_code == 123 ]] \
+[[ $vis_code == 1 || $vis_code == 2 || $vis_code == 123 ]] \
   || { scriptEcho -e "unrecognized visit code: $vis_code"; exit 2; }
 
 metric=$1 && shift
@@ -53,20 +53,18 @@ tmp_dir=$(mktemp --tmpdir -d "ca.spinup.$(basename $0)_pid$$.XXXXX")
 
 # Parse visit code
 if [[ $vis_code == 1 ]]; then
-    # subjid_list_file=${gr_res_dir}/cohort_csvs/subjid_list-v01.txt
     visit_list_file=${gr_res_dir}/cohort_csvs/visit_list-v01.txt
     skel_dir=${proj_dir}/data/merged_skel_v01
-# elif [[ $vis_code == 12 ]]; then
-# elif [[ $vis_code == 13 ]]; then
+elif [[ $vis_code == 2 ]]; then
+    visit_list_file=${gr_res_dir}/cohort_csvs/visit_list-v02.txt
+    skel_dir=${proj_dir}/data/merged_skel_v02
 elif [[ $vis_code == 123 ]]; then
-    # subjid_list_file=${gr_res_dir}/cohort_csvs/subjid_list-v01v02v03.txt
     visit_list_file=${gr_res_dir}/cohort_csvs/visit_list-v01v02v03.txt
     skel_dir=${proj_dir}/data/merged_skel_v01v02v03
 fi
 
 # Check sensible conditions
 [[ -d $skel_dir ]] || { scriptEcho -e "dir not found: $skel_dir"; exit 2; }
-# [[ -f "$subjid_list_file" ]] || { scriptEcho -e "file not found: $subjid_list_file"; exit 2; }
 [[ -f "$visit_list_file" ]] || { scriptEcho -e "file not found: $visit_list_file"; exit 2; }
 
 out_dir=${gr_res_dir}/$(basename $skel_dir)
@@ -77,15 +75,8 @@ out_dir=${gr_res_dir}/$(basename $skel_dir)
 #   fa_niis=($(find subprojects -path '*/*/*_01/dti_preprocessed/jhu-space/dti-fsl_FA-jhusp.nii.gz' | sort))
 n=$(wc -l $visit_list_file | cut -d ' ' -f 1)
 
-# subjid_list=($(cat "$subjid_list_file"))
 # scriptEcho "Parsing $n visit IDs ..."
 
-# # write out subjids with _01 glob
-# for sid in ${subjid_list[@]}; do
-#     echo "${sid}"${nameglob} >> ${tmp_dir}/visit_ids_col.txt
-#     exit 99
-#     # read this from visit_list_file=${gr_res_dir}/cohort_csvs/visit_list-v01v02v03.txt
-# done
 
 # Extract JHU ROI data from skeletonized data for $metric
 #   N.B. This code adapted from dti_extract_ROIdata
@@ -172,4 +163,4 @@ paste -d ',' \
       > ${out_dir}/skelperiph_L_mean${metric}_data.csv
 
 # Clean up
-rm -rf ${tmp_dir}
+/bin/rm -rf ${tmp_dir}

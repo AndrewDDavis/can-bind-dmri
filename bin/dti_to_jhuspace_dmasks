@@ -34,32 +34,43 @@ mkdir -p ${jhu_reg_dir}
 echo "Creating JHU warps..."
 
 jhu_atlas="${FSLDIR}/data/atlases/JHU/JHU-ICBM-FA-2mm"
-$FSLDIR/bin/fslmaths ${prep_dir}/wdt_FA \
-                     -kernel box 7.5 -ero \
-                     ${jhu_dir}/wdt_FA_ero
 
-$FSLDIR/bin/flirt -in ${jhu_dir}/wdt_FA_ero \
+# old method: erode the mask to get rid of cruft at the edges
+if false; then
+    $FSLDIR/bin/fslmaths ${prep_dir}/wdt_FA \
+                         -kernel box 7.5 -ero \
+                         ${jhu_dir}/wdt_FA_ero
+    moving_image=wdt_FA_ero
+
+elif true; then
+    moving_image=wdt_FA
+    # need to add dmasks to the reg commands below
+
+fi
+
+
+$FSLDIR/bin/flirt -in ${jhu_dir}/${moving_image} \
                   -ref "${jhu_atlas}" \
                   -dof 12 \
                   -interp spline \
-                  -omat "${jhu_reg_dir}"/wdt_FA_ero_to_JHU_FA_2mm_linear.xfm \
-                  -out "${jhu_reg_dir}"/wdt_FA_ero-jhu_space_linear
+                  -omat "${jhu_reg_dir}"/${moving_image}_to_JHU_FA_2mm_linear.xfm \
+                  -out "${jhu_reg_dir}"/${moving_image}-jhu_space_linear
 
-$FSLDIR/bin/fnirt --ref="${jhu_atlas}" \
-                  --in=${jhu_dir}/wdt_FA_ero \
-                  --iout="${jhu_reg_dir}"/wdt_FA_ero-jhu_space_nonlinear \
-                  --aff="${jhu_reg_dir}"/wdt_FA_ero_to_JHU_FA_2mm_linear.xfm \
-                  --cout="${jhu_reg_dir}"/wdt_FA_ero_to_JHU_FA_2mm_nonlinear_cout_warpfields \
+$FSLDIR/bin/fnirt --in=${jhu_dir}/${moving_image} \
+                  --ref="${jhu_atlas}" \
+                  --iout="${jhu_reg_dir}"/${moving_image}-jhu_space_nonlinear \
+                  --aff="${jhu_reg_dir}"/${moving_image}_to_JHU_FA_2mm_linear.xfm \
+                  --cout="${jhu_reg_dir}"/${moving_image}_to_JHU_FA_2mm_nonlinear_cout_warpfields \
                   --config="${fnirt_config_file}" \
-                  --logout="${jhu_reg_dir}"/wdt_FA_ero_to_JHU_FA_2mm_nonlinear.log
+                  --logout="${jhu_reg_dir}"/${moving_image}_to_JHU_FA_2mm_nonlinear.log
 
-$FSLDIR/bin/invwarp -w "${jhu_reg_dir}"/wdt_FA_ero_to_JHU_FA_2mm_nonlinear_cout_warpfields \
-                    -o "${jhu_reg_dir}"/JHU_FA_2mm_to_wdt_FA_ero_nonlinear_cout_warpfields \
-                    -r ${jhu_dir}/wdt_FA_ero
+$FSLDIR/bin/invwarp -w "${jhu_reg_dir}"/${moving_image}_to_JHU_FA_2mm_nonlinear_cout_warpfields \
+                    -o "${jhu_reg_dir}"/JHU_FA_2mm_to_${moving_image}_nonlinear_cout_warpfields \
+                    -r ${jhu_dir}/${moving_image}
 
 $FSLDIR/bin/applywarp -i "${jhu_atlas}" \
-                      -r ${jhu_dir}/wdt_FA_ero \
-                      -w "${jhu_reg_dir}"/JHU_FA_2mm_to_wdt_FA_ero_nonlinear_cout_warpfields \
+                      -r ${jhu_dir}/${moving_image} \
+                      -w "${jhu_reg_dir}"/JHU_FA_2mm_to_${moving_image}_nonlinear_cout_warpfields \
                       -o "${jhu_reg_dir}"/JHU_FA_2mm-diff_space_nonlinear
 
 # Apply warp to DTI scalar metric images
@@ -75,7 +86,7 @@ function apply_new_warp {
     [[ $(${FSLDIR}/bin/imtest "${prep_dir}"/"${in_img}") == 1 ]] || { echo "Error: ${prep_dir}/${in_img} not found in ${PWD}."; exit 2; }
     $FSLDIR/bin/applywarp -i "${prep_dir}"/"${in_img}" \
                           -r "${jhu_atlas}" \
-                          -w "${jhu_reg_dir}"/wdt_FA_ero_to_JHU_FA_2mm_nonlinear_cout_warpfields \
+                          -w "${jhu_reg_dir}"/${moving_image}_to_JHU_FA_2mm_nonlinear_cout_warpfields \
                           --interp="${intrpm}" \
                           -o "${jhu_dir}"/"${in_img_pref}"-jhusp
 }

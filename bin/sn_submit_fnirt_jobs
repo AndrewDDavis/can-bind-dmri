@@ -1,0 +1,96 @@
+#!/bin/bash
+
+# Run this on Graham to start dti_to_jhuspace jobs
+
+# Arg defaults and parsing
+dry_run=False
+vis_list=()
+
+while [[ $# -gt 0 ]]; do
+    if [[ "$1" == '-n' ]]; then
+        dry_run=True
+        shift
+    else
+        vis_list=($1)
+        shift
+    fi
+done
+
+
+# CB-DTI project
+cd ~/project/davisad/CAN-BIND_DTI
+export PWD
+
+# Ensure FSL is available
+if ! which fsl > /dev/null 2>&1; then
+    echo "FSL not found"
+    exit 2
+elif [[ "$FSLDIR" != /home/davisad/fsl ]]; then
+    echo "FSLDIR incorrect"
+    exit 2
+fi
+
+# Locate wdt_FA niis to be run
+echo "Locating wdt_FA files..."
+if [[ ${#vis_list[@]} -gt 0 ]]; then
+    files_arr=()
+    for v in "${vis_list[@]}"; do
+        files_arr+=($(find 'data/subprojects/' -wholename "*/$v/dmri_dmasks/wdt_FA.nii.gz" -print))
+    done
+else
+    files_arr=($(find 'data/subprojects/' -wholename '*/*/dmri_dmasks/wdt_FA.nii.gz' -print | sort))
+fi
+
+if [[ ${#files_arr[@]} -eq 0 ]]; then
+    echo "No files found"
+    exit 2
+else
+    echo "Found ${#files_arr[@]} files"
+    start_time=$(date '+%H:%M')
+fi
+
+# Add dmasks job to the Graham scheduler
+for f in "${files_arr[@]}"; do
+
+    # e.g. f -> data/subprojects/UCA_B/UCA_0075_02/dmri_dmasks/wdt_FA.nii.gz
+    new_path="${f%/dmri_dmasks/wdt_FA.nii.gz}"
+    new_vid=$(printf $f | cut -d '/' -f 4)
+
+    # check for run already started
+    if [[ -n "$(find "${new_path}/dmri_dmasks" -maxdepth 1 -name 'jhuspace_job-*.out' -print -quit)" ]]; then
+        echo "sbatch output file exists; skipping ${new_path}"
+        continue
+    elif [[ -d "${new_path}/dmri_dmasks/jhu-space" ]]; then
+        echo "jhu-space dir exists; skipping ${new_path}"
+        continue
+    fi
+
+    pushd "${new_path}" > /dev/null
+    export PWD
+
+    # make a copy of the generic job and edit it
+    cp -f ~/bin/sn_fnirt_indiv_job ~/bin/sn_fnirt_indiv_job_working
+
+    sed --in-place "s/dummy_vid/${new_vid}/" ~/bin/sn_fnirt_indiv_job_working
+
+    # For this job, UCA images take ~ 5-7 min; so just allocate 12 min; all seem to take the same memory
+
+    # schedule the job
+    if [[ $dry_run == True ]]; then
+        echo "Would submit job for ${new_path}"
+    else
+        echo "Submitting job for ${new_path}"
+        sbatch ~/bin/sn_fnirt_indiv_job_working
+    fi
+
+    popd > /dev/null
+    rm ~/bin/sn_fnirt_indiv_job_working
+
+    # don't overwhelm the scheduler
+    sleep 1
+done
+
+echo "Done"
+echo "Monitor jobs with: squeue -u $USER -t all"
+echo "and/or: sacct --format='JobID,JobName%15,State,ExitCode,Timelimit,Elapsed,NCPUS,TotalCPU,ReqMem,MaxRSS' -S ${start_time}"
+

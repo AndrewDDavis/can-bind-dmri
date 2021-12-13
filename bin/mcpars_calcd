@@ -1,67 +1,183 @@
 #!/usr/bin/env python
-"""not intended as a module"""
+# coding: utf-8
+"""Intended as a command-line script, not for import as a module."""
+
 from __future__ import division
 import plac
+import os
+import numpy as np
+import csv
+
 
 @plac.annotations(
     pars_file="CSV file with 13 columns of MC parameters"
     )
 
+
 def main(pars_file):
     """This script takes one argument: a xfmpars file, which was output by
     FSL's eddy_correct, the dti_preprocess script, and mcmats2csv.
 
-    Writes output to the qc dir, as dwi_ecc-xfmPars-rms_dspl_b0mean.csv, b0std
-    and b1mean/std.
+    Writes output to the qc dir, as dwi_ecc-xfmPars-fdst_mm.csv. This
+    includes the mean displacement, mean framewise displacement, the values
+    for only the b=0 volumes, and the total fd vector. This scripts attempts
+    to account for the shift due to distortions by the DW gradients.
 
-    Example: mcpars_calcd dti_preprocessed/dwi_ecc-xfmPars.csv
+    Example:
+      mcpars_calcd dti_preprocessed/dwi_ecc-xfmPars.csv
+
+    Can be run from the subprojects dir on all subjects with a line like:
+      for f in $(find * -name 'dwi_ecc-xfmPars.csv' | sort); do
+        echo "$f"; mcpars_calcd "$f" || break
+      done
     """
 
-    import os
-    import numpy as np
-    import csv
-
+    # Read motion parameters matrix
     assert os.path.isfile(pars_file)        # assert file exists
 
-    A = np.genfromtxt(pars_file, names=True)
-    r=7.5
-    x = A['TransX'] + r*A['RotY']
-    y = A['TransY'] + r*A['RotZ']
-    z = A['TransZ'] + r*A['RotX']
+    M = np.genfromtxt(pars_file, names=True)
+
+    # Output file
+    qc_dir = pars_file[:-19] + 'qc/'            # e.g. 'dti_preprocessed/qc/'
+    assert os.path.isdir(qc_dir), "QC dir not found: {}".format(qc_dir)
+    out_fn = qc_dir + 'dwi_ecc-xfmPars-fdst_mm.csv'
+
+
+    # Also need bvals
+    bval_file = pars_file[:-19] + 'dwi_merged.bval'
+    assert os.path.isfile(bval_file), "b-vals file not found: {}".format(bval_file)
+
+    bvals = np.genfromtxt(bval_file)    # 37 element array
+    t2w_vols = (bvals == 0)
+    dw_vols = ~t2w_vols
+
+
+    # Calculate total displacement assuming motion on surface of a 75 mm sphere
+    #   - cortex is about 75 mm radius based on scalp circumference of ~ 57 cm
+    #   - units of dwi_ecc-xfmPars.csv are radians and mm; use s=r𝜃 approximation
+    #   - calculated d values along each axis represent sort of "worst case scenario" where
+    #     the rotation and translation values add
+    #   - e.g. max y-translations can come from rotations about x or z, and the translation on
+    #     some part of the sphere that results from these rotations will be in the same direction
+    #     as the y-translation. But the translations resulting from these x and z rotations are
+    #     not maximal at the same location on the sphere. So the worst case y-translation due to
+    #     rotations is the max of the absolute value of these two.
+    radx = 60     # estimated from gyri centres in the MNI152 brain
+    rady = 75
+    radz = 55
+
+    tx = M['TransX']; ty = M['TransY']; tz = M['TransZ']    # true translations
+    rx = M['RotX']; ry = M['RotY']; rz = M['RotZ']          # rotations in radians
+
+    # Reference frame should really have 0 displacement: why doesn't it, FSL?
+    #   account for this by re-centering the vectors around the reference frame transformation
+    #   this is the same way the reference frame is chosen as in dti_preprocess
+    if bvals[1] == 0:
+        ref = 1
+    elif bvals[0] == 0:
+        ref = 0
+
+    def recenter(v):
+        """subtract off reference frame values (re-center)"""
+        return v - v[ref]
+
+    tx, ty, tz, rx, ry, rz = [recenter(v) for v in [tx, ty, tz, rx, ry, rz]]
+
+    # Calculate distance according to above strategy: translations and arclengths
+    x = np.abs(tx) + np.maximum(radz*np.abs(ry), rady*np.abs(rz)) 
+    y = np.abs(ty) + np.maximum(radz*np.abs(rx), radx*np.abs(rz)) 
+    z = np.abs(tz) + np.maximum(rady*np.abs(rx), radx*np.abs(ry))
+
     d = np.sqrt(x**2 + y**2 + z**2)
 
-    # output to file named similar to input
-    qc_dir = pars_file[:-19] + 'qc/'
-    assert os.path.isdir(qc_dir)
-    arr_fn = qc_dir + 'dwi_ecc-xfmPars-rms_dspl.csv'
-    mean_fn = qc_dir + 'dwi_ecc-xfmPars-rms_dspl_mean.csv'
+    # Account for and discount the distortions due to diffusion weighting gradients
+    # - low motion datasets, e.g. MCU_0025_02, tend to produce very similar displacement
+    #   values for all of the t2w vols and all of the dw vols, with an "offset"
+    # - the offset is difficult/impossible to know, but this should be a good first
+    #   approximation
+    d[dw_vols] -= np.percentile(d[dw_vols], 25)
+    d = np.abs(d)
 
-    np.savetxt(arr_fn, d, fmt='%.3f')
-    with open(mean_fn, 'w') as f:
-        f.write("{:0.2f}\n".format(d.mean()))
 
-    # output for only b=0 images
-    bval_file = pars_file[:-19] + 'dwi_merged.bval'
-    assert os.path.isfile(bval_file)
-    bvals = np.genfromtxt(bval_file)    # 37 element array
+    # Calculate frame-wise displacement
+    # - maybe better strategy: frame-wise displacement matters more, and somewhat accounts
+    #   for shift/offset due to diffusion weighting, though there will be one big "shift" at
+    #   the boundary
+    dtx, dty, dtz, drx, dry, drz = [np.diff(v) for v in [tx, ty, tz, rx, ry, rz]]
 
-    meanb0_fn = qc_dir + 'dwi_ecc-xfmPars-rms_dspl_b0mean.csv'
-    meanb1_fn = qc_dir + 'dwi_ecc-xfmPars-rms_dspl_b1mean.csv'
+    dx = np.abs(dtx) + np.maximum(radz*np.abs(dry), rady*np.abs(drz))
+    dy = np.abs(dty) + np.maximum(radz*np.abs(drx), radx*np.abs(drz))
+    dz = np.abs(dtz) + np.maximum(rady*np.abs(drx), radx*np.abs(dry))
 
-    with open(meanb0_fn, 'w') as f:
-        f.write("{:0.2f}\n".format(d[bvals == 0].mean()))
-    with open(meanb1_fn, 'w') as f:
-        f.write("{:0.2f}\n".format(d[bvals != 0].mean()))
+    fd = np.sqrt(dx**2 + dy**2 + dz**2)
 
-    stdb0_fn = qc_dir + 'dwi_ecc-xfmPars-rms_dspl_b0std.csv'
-    stdb1_fn = qc_dir + 'dwi_ecc-xfmPars-rms_dspl_b1std.csv'
 
-    with open(stdb0_fn, 'w') as f:
-        f.write("{:0.2f}\n".format(d[bvals == 0].std()))
-    with open(stdb1_fn, 'w') as f:
-        f.write("{:0.2f}\n".format(d[bvals != 0].std()))
+    # Power et al. method is more straighforward, and uses a 50 mm sphere:
+    # fd = |𝝙x| + |𝝙y| + |𝝙z| + |𝝙sx| + |𝝙sy| + |𝝙sz|
+    # drx, dry, drz = [v*50/75 for v in [drx, dry, drz]]
+    # fdp = np.abs(dtx) + np.abs(dty) + np.abs(dtz) + np.abs(drx) + np.abs(dry) + np.abs(drz)
+
+    # the Power method gives similar trends, but tends to overestimate the peak/extreme values
+
+
+    # find a dw_vols for the difference data -- any diff that involves a diffusion vol
+    t2w_dvols = (np.diff(bvals) == 0) & (np.diff(np.cumsum(bvals)) == 0)
+    dw_dvols = ~t2w_dvols
+
+    # Need to account for distortion fd, which should be roughly constant over the dw-vols.
+    # So the lower quartile fd shifts are probably distortion only, while higher quartile
+    # are more likely to be motion as well.
+    # Therefore subtract off the 25th percentile dw-fd from all dw-fd values
+    fd[dw_dvols] -= np.percentile(fd[dw_dvols], 25)
+    fd = np.abs(fd)
+
+    # MCU-25: -> raw d values are so consistent, but fd is so high! why?
+    #            motion looks low here, but distortions look higher, maybe
+    #            because of no HOS; and distortions change direction every
+    #            volume, so more fd
+    # MCU-51: -> really hard to tell, but pretty stable throughout,
+    #            except a movement at vol6, and a z-movement at the end
+    #            (last 2 frames)
+
+    # MCU-25 (low motion, high distortion): d.mean = 0.41; fd.mean = 1.01
+    # MCU-51 (some motion, lower distortion): d.mean = 2.70; fd.mean = 0.66
+    # MCU-36 (some (high?) motion, low distortion): d.mean = 2.55; fd.mean = 1.88
+    # MCU-66 (low motion, low distortion): d.mean = 0.50; fd.mean = 0.99
+    # UBC_32 (some (high?) motion, Philips): d.mean = 0.83; fd.mean = 1.02
+    # UBC_34 (low motion, Philips): d.mean = 0.62; fd.mean = 0.52
+
+    # take-home message:
+    # - if the d is high for the subj, that means they moved
+    # - if the fd is also high, they moved many times, if it's low there may be a single movement
+
+    # np.set_printoptions(precision=3, suppress=True)
+    # import ipdb; ipdb.set_trace()
+    # import sys; sys.exit(1)
+
+
+    # Write out means of d and fd, as well as b0fd and the full fd vector
+    print("Writing distances to {}".format(out_fn))
+    with open(out_fn, 'w') as of:
+        of.write("d-mean: {:0.2f}\n".format(d.mean()))
+        of.write("fd-mean: {:0.2f}\n".format(fd.mean()))
+
+        if np.sum(t2w_vols) > 1:
+            of.write("d-b0mean: {:0.2f}\n".format(d[t2w_vols].mean()))
+        else:
+            of.write("d-b0mean: NaN\n")
+
+        if np.sum(t2w_dvols) > 0:
+            of.write("fd-b0mean: {:0.2f}\n".format(fd[t2w_dvols].mean()))
+        else:
+            of.write("fd-b0mean: NaN\n")
+
+        of.write("fd vector follows:\n")
+
+    with open(out_fn, 'a') as of:
+        np.savetxt(of, fd, fmt='%.3f')
 
 
 # Entry point
 if __name__ == '__main__':
     plac.call(main)
+

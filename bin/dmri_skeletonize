@@ -9,7 +9,7 @@ cat << EOF
     ----------------
     This script produces skeletonized images (FA, etc). Writes images to
     <proj-dir>/data/merged_skel_*. Also writes a corresponding visit
-    list file to <proj-dir>/group_results/cohort_csvs/visit_list-v01.txt.
+    list file to <proj-dir>/group_results/cohort_csvs/visit_list-v00.txt.
 
     See "DTI ROI analysis notes".
 
@@ -18,7 +18,7 @@ cat << EOF
 
     Arguments
     ---------
-      - visit_code: cohort to use; one of {1,12,13,123}
+      - visit_code: cohort to use; one of {1,2,123}
       - metric: type of data; one of {FA, MD, etc}
 
 EOF
@@ -46,11 +46,11 @@ cingroi=${rois_dir}/LowerCingulum_2mm
 gr_res_dir=${proj_dir}/group_results
 
 # Arguments
-[[ $# -eq 0 ]] && { print_usage; exit 1; }
+[[ $# -eq 0 ]] || [[ $1 == '-h' ]] || [[ $1 == '--help' ]] && { print_usage; exit 1; }
 [[ $# -eq 2 ]] || { scriptEcho -e "expected 2 args."; exit 2; }
 
 vis_code=$1 && shift
-[[ $vis_code == 1 || $vis_code == 12 || $vis_code == 13 || $vis_code == 123 ]] \
+[[ $vis_code == 1 || $vis_code == 2 || $vis_code == 123 ]] \
   || { scriptEcho -e "unrecognized visit code: $vis_code"; exit 2; }
 
 metric=$1 && shift
@@ -64,12 +64,13 @@ metric=$1 && shift
 if [[ $vis_code == 1 ]]; then
     nameglob=_01
     subjid_list_file=${gr_res_dir}/cohort_csvs/subjid_list-v01.txt
-    visit_list_file=${gr_res_dir}/cohort_csvs/visit_list-v01.txt
-    skel_dir=${proj_dir}/data/merged_skel_v01
-elif [[ $vis_code == 12 ]]; then
-    nameglob=_0[12]
-elif [[ $vis_code == 13 ]]; then
-    nameglob=_0[13]
+    visit_list_file=${gr_res_dir}/cohort_csvs/visit_list-v01.txt       # will be created 
+    skel_dir=${proj_dir}/data/merged_skel_v01                          # will be created for FA
+elif [[ $vis_code == 2 ]]; then
+    nameglob=_02
+    subjid_list_file=${gr_res_dir}/cohort_csvs/subjid_list-v02.txt
+    visit_list_file=${gr_res_dir}/cohort_csvs/visit_list-v02.txt
+    skel_dir=${proj_dir}/data/merged_skel_v02
 elif [[ $vis_code == 123 ]]; then
     nameglob=_0[123]
     subjid_list_file=${gr_res_dir}/cohort_csvs/subjid_list-v01v02v03.txt
@@ -120,7 +121,7 @@ n_files=${#subj_niis[@]}
 
 
 # Merge all standard space images into single 4D image
-#   n=304 for v01, n=702 for v01v02v03, n=808 for all data available
+#   n=304 for v01, n=263 for v02, n=702 for v01v02v03, n=808 for all data available
 scriptEcho "Merging ${#subj_niis[@]} $metric niis into ${skel_dir}/ ..."
 fslmerge -t ${skel_dir}/all_$metric "${subj_niis[@]}"
 cd $skel_dir

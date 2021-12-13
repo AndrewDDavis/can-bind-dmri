@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+
+# v0.1 (May 2020) by Andrew Davis (addavis@gmail.com)
+
+# Preprocess dMRI scans on fBIRN phantoms to generate QC measures
+#
+# Script takes 1 required argument
+#   Arg 1: directory containing DICOM files
+#
+# Outputs preprocessed dMRI files and QC files in a subdirectory named
+#   after this script.
+#
+# Example usage:
+#   fbn_dmri_ppl exam_0042
+
+# Parse Args
+[[ $# -eq 0 ]] && { echo "$(basename $0): expected 1 argument (dicom dir)"; exit 2; }
+
+dcmd="${1%/}" && shift
+
+[[ -d "$dcmd" ]] || { echo "$(basename $0): dir not found: $dcmd"; exit 2; }
+
+
+# Definitions
+# d: dmri scripts expected to be within this dir
+#    presumably this script is there too
+# d="/home/andrew/Documents/Research_Projects/CBN01-dMRI"
+d="$(dirname "${BASH_SOURCE[0]}")"
+export DMRIDIR="$(cd "$d"; pwd -P)"     # absolute path
+
+
+# Main Work
+# Create working dir in current dir
+s=$(basename $0)
+wdir=./${s}-${$}
+mkdir $wdir
+
+# Convert dcm to nii
+dcm2niix -b y -z y -f '%d' -o $wdir "$dcmd" \
+  || { "Problem with dcm2niix"; exit 2; }
+
+# dMRI related files should now be at $wdir/DTI*.nii.gz and .bval/bvec
+
+# Check for files and preprocess what's found
+"$DMRIDIR"/dmri_preprocess --data_type fbnp $wdir \
+  || { "Problem with dmri_preprocess"; exit 2; }
+
+# Rename wdir, avoiding overwrite
+outdir=${s/_ppl/}
+[[ -d $outdir ]] \
+  && echo "directory exists: $outdir" \
+  || /bin/mv $wdir $outdir
+
+# possibly we just want the QC directory here, and discard everything else

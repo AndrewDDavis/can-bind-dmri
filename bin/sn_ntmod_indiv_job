@@ -1,0 +1,246 @@
+#!/bin/bash
+#SBATCH --account=def-hallg
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=cpu_cnt
+#SBATCH --mem-per-cpu=mem_amt
+#SBATCH --time=time_limit
+#SBATCH --job-name=dummy_vid
+#SBATCH --output=dummy_path/ntmod-%j.out
+
+# Robust options
+set -o nounset    # fail on unset variables
+set -o errexit    # fail on non-zero return values
+set -o pipefail   # fail if any piped command fails
+
+# make sure of the environment
+module purge 2> /dev/null
+
+# Run multiple slices at a time (1 per cpu) with the edited fsl_sub
+#   note OMP_NUM_THREADS does not have an effect here
+export FSLPARALLEL=cpus_perbpx
+
+
+# Prepare bpx input dir in dmripp
+cd dummy_path
+
+bpxdir_bn=bedpostx_input     # base name of bpx dir -- may have b-value and quadrant added by script
+
+# Avoid race condition on bpxdir_bn from concurrent jobs
+if lockfile -2 -r10 ${bpxdir_bn}.lock
+then
+    if [[ ! -d ${bpxdir_bn} ]]
+    then
+        mkdir ${bpxdir_bn}
+        ln -s ../dwi_stdpp.nii.gz ${bpxdir_bn}/data.nii.gz      # n.b. link targets relative to new link location
+        ln -s ../mask-fine_bbg.nii.gz ${bpxdir_bn}/nodif_brain_mask.nii.gz
+        ln -s ../dwi_stdpp.bval ${bpxdir_bn}/bvals
+        ln -s ../dwi_stdpp.bvec ${bpxdir_bn}/bvecs
+
+        bedpostx_datacheck ${bpxdir_bn} > ${bpxdir_bn}/bedpostx_datacheck.log
+    fi
+    /bin/rm -f ${bpxdir_bn}.lock
+
+else
+    echo "couldn't get lock on ${bpxdir_bn}"
+    exit 2
+fi
+
+# Prepare bedpostx arguments
+# need to use xfibres style options to give a random seed (first run gets default seed)
+# random integers from random.org/integers
+# last 3 were added later, responding to feedback; need ~ 8 at least to calculate SD
+seeds=(nan 748786 79370 502825 110792 62735 109843 929694)
+sfxs=(A B C D E F G H)  # used H_wpriors here when setting --Rmean and --Rstd
+
+model=2      # model number; 1=sticks, 2=sticks with range of diffusivities, 3=zeppelins
+nfibres=2    # number of fibres per voxel
+burnin=1000  # burnin period
+
+# prefix for the bedpostx input/output dirs
+bpxdir_pref="${bpxdir_bn}_m${model}_n${nfibres}_bi${burnin}"
+
+# which seed(s) will run is determined in the submit script
+idxs=(0)
+
+function check_run_bpx {
+
+    local i=$1            # capture current idx for this function execution
+    local s=${sfxs[$i]}   # letter suffix
+
+    # on completion, will simplify output dir name
+    local bpx_indir=${bpxdir_pref}-$s
+    local bpx_outdir=${bpx_indir}.bedpostX
+    local final_outdir=${bpxdir_pref/bedpostx_input/ntmod}.bedpostX-$s
+
+    # ensure this run is not already done or in-progress
+    if [[ -d $bpx_indir ]]
+    then
+        echo "ntmod: Error: input dir exists: $bpx_indir"
+        exit 2
+
+    elif [[ -d $bpx_outdir ]]
+    then
+        echo "ntmod: Error: unfinished output dir exists: $bpx_outdir"
+        exit 2
+
+    elif [[ -d ${bpxdir_pref}.bedpostX-$s ]]
+    then
+        echo "ntmod: Error: output dir exists: ${bpxdir_pref}.bedpostX-$s"
+        exit 2
+
+    elif [[ -d $final_outdir ]]
+    then
+        echo "ntmod: Error: output dir exists: $final_outdir"
+        exit 2
+    fi
+
+    # create specific input dir copy for predictable output naming
+    /bin/cp -rd $bpxdir_bn $bpx_indir
+
+    # collect arguments for bedpostx (xfibres style)
+    # now using --noard to always get a value for the second tissuefrac
+    local bpx_args=($bpx_indir \
+                    --model=${model} --nf=${nfibres} \
+                    --bi=${burnin} --nj=1250 --se=25 \
+                    --cnonlinear --noard)
+
+    [[ $i -ne 0 ]] && bpx_args+=(--seed=${seeds[$i]})
+
+    # Prior for zeppelin model; based on my data values
+    # Note this made small differences to the values -- higher f due to larger λR
+    # Didn't change SSE or BIC very much, but probably good to do in production
+    # if [[ $model -eq 3 ]]; then
+    #     bpx_args+=(--Rmean=0.147)
+    #     bpx_args+=(--Rstd=0.053)
+    # fi
+
+
+    # Run bedpostx
+    printf "\nntmod: Running 'bedpostx ${bpx_args[*]}'\n\n"
+    $FSLDIR/bin/bedpostx ${bpx_args[@]}
+
+
+    # remove very large merged files to save space
+    /bin/rm $bpx_outdir/merged_*samples.nii*
+
+    # zip logs dir and other bpx files
+    echo "ntmod: zipping to $bpx_outdir/bedpostx_logs.zip"
+    ( cd $bpx_outdir
+    zip -qmroy bedpostx_logs.zip \
+        {bvals,bvecs,commands.txt,logs,monitor,xfms}; )
+
+    # Convert diffusivity values to um^2/ms for convenience of later processing
+    echo "ntmod: converting diffusivity values"
+    $FSLDIR/bin/fslmaths $bpx_outdir/mean_dsamples \
+               -mul 1000 $bpx_outdir/mean_dsamples
+
+    if [[ $model == 2 || $model == 3 ]]
+    then
+        $FSLDIR/bin/fslmaths $bpx_outdir/mean_d_stdsamples \
+                   -mul 1000 $bpx_outdir/mean_d_stdsamples
+    fi
+
+    # Move and clean up output/input dirs
+    /bin/mv -n $bpx_outdir $final_outdir
+    /bin/rm -r $bpx_indir
+
+    echo "ntmod: Done"
+}
+
+for idx in ${idxs[*]}
+do
+    check_run_bpx $idx &
+    sleep 5s
+done
+
+if [[ ${#idxs[*]} -eq 1 ]]
+then
+    wait %1     # use specific jobspec, so wait gets the correct exit status and errexit works
+
+elif [[ ${#idxs[*]} -eq 2 ]]
+then
+    wait %1 %2
+fi
+
+
+# need the final_outdir of idxs[0] run for the next parts
+#   e.g. od0 -> ntmod_b1000_m1_n2_bi50000.bedpostX-D
+#            or ntmod_b3000_1of4_m3_n2_bi1000.bedpostX-B
+i0=${idxs[0]}
+s0=${sfxs[${i0}]}
+od0="${bpxdir_pref/bedpostx_input/ntmod}.bedpostX-${s0}"
+
+
+# Check if this was a quadrant, and all are now complete
+# - note this relies on never combining the run_2j and quadrants functionality
+# - this functionality is also in the script ntmod_combine_qs
+if [[ $bpxdir_bn == *of4 ]]
+then
+    q=${bpxdir_bn:(-4):1}       # this quadrant
+
+    if [[ -d ${od0/_${q}of4/_1of4} && \
+          -d ${od0/_${q}of4/_2of4} && \
+          -d ${od0/_${q}of4/_3of4} && \
+          -d ${od0/_${q}of4/_4of4} ]]
+    then
+        echo "combining files from 4 quadrants..."
+        sleep 5s        # in case some job is still zipping its log file
+
+        combo_dir="${od0/_${q}of4/}"
+        /bin/mkdir "$combo_dir"
+
+        # copy zipped log files in
+        for qq in 1 2 3 4
+        do
+            src_dir="${od0/_${q}of4/_${qq}of4}"
+            /bin/mv "$src_dir"/bedpostx_logs.zip "$combo_dir"/bedpostx_logs_q${qq}.zip
+        done
+
+        # sum images to combine quarter-masked data
+        for nii_path in "$od0"/*.nii.gz
+        do
+            nii_bn="$(basename $nii_path)"
+
+            $FSLDIR/bin/fslmaths ${nii_path/_${q}of4/_1of4} \
+                            -add ${nii_path/_${q}of4/_2of4} \
+                            -add ${nii_path/_${q}of4/_3of4} \
+                            -add ${nii_path/_${q}of4/_4of4} \
+                            "${combo_dir}/${nii_bn}"
+
+            /bin/rm ${nii_path/_${q}of4/_[1-4]of4}
+        done
+
+        # clean up q dirs
+        for qq in 1 2 3 4
+        do
+            /bin/rmdir "${od0/_${q}of4/_${qq}of4}"
+        done
+
+        # zip job output log as with the other quadrants
+        zip -qmroy "$combo_dir"/bedpostx_logs_q${q}.zip ntmod-${SLURM_JOB_ID}.out
+
+    else
+        # zip job output as usual
+        zip -qmroy ${od0}/bedpostx_logs.zip ntmod-${SLURM_JOB_ID}.out
+    fi
+else
+    # The job log contains nothing useful if it was successful
+    #   keeping it just for curiosity
+    zip -qmroy ${od0}/bedpostx_logs.zip ntmod-${SLURM_JOB_ID}.out
+fi
+
+
+### vvv
+# Note, in the abstract I used calls like this:
+
+# For running defaults matrix
+# cd abs_testing_matrix-defaults/
+# slabdir=slab-m${m}_n${n}_bi${b}
+# /bin/cp -R ../bedpostx_input-slab $slabdir
+
+# For running BSS_v_BZZ matrix
+# cd abs_testing_matrix-BSS_v_BZZ/
+# slabdir=slice-m${m}_n${n}_bi${b}
+# /bin/cp -R ../bedpostx_input-slice $slabdir
+### ^^^

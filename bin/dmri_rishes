@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+# coding: utf-8
+"""This program calculates spherical harmonic (SH) coefficients using amp2sh from mrtrix; then
+calculates the rotationally invariant SH (RISH) maps for each order.
+
+Expects to find bvec and bval files next to the input nii file.
+
+Writes out RISH images next to input nii file, with the same name as the input file prefix, then
+suffix -rish_lX.
+
+To see why this is useful, refer to Mirzaalian, 2016 paper (doi: 10.1016%2Fj.neuroimage.2016.04.041)
+on SH/RISH features for diffusion MRI data harmonization.
+
+For further explanation of spherical harmonic basis, see [Geng, 2011](http://doi.org/10.1109/TMI.2010.2095027).
+"""
+
+__author__ = "Andrew Davis (addavis@gmail.com)"
+__version__ = "0.2 (Jan 2021)"
+__license__ = "Distributed under The MIT License (MIT).  See http://opensource.org/licenses/MIT for details."
+
+import sys, os, shutil, tempfile
+from glob import glob
+import nibabel as nib
+import pandas as pd
+import numpy as np
+import subprocess as sp
+
+import dmri_utils as du     # dmri_utils.py in same directory as script
+
+# temp directory to hold scratch files
+tmpd = tempfile.mkdtemp()
+
+# using absolute paths to executables
+assert 'FSLDIR' in os.environ, "FSLDIR not set in envirionment"
+assert 'MRTRIXDIR' in os.environ, "MRTRIXDIR not set in envirionment"
+
+# gzip or not
+if '_GZ' in os.environ['FSLOUTPUTTYPE']:
+    nii_suff = 'nii.gz'
+else:
+    nii_suff = 'nii'
+
+
+def main(nii, sho, b=1000, norm=False):
+    """Let's calculate some RISHes!"""
+
+    # Input files
+    nii_fn = nii.get_filename()
+    nii_prefix = du.get_nii_prefix(nii_fn)
+    bval_fn = f'{nii_prefix}.bval'
+    bvec_fn = f'{nii_prefix}.bvec'
+
+    # Output file
+    sh_fn = nii_prefix + f'-sharm{sho}.{nii_suff}'
+
+    # Number of SH coeffs at chosen max order
+    if sho == 0:
+        shn = 1
+    elif sho == 2:
+        shn = 6
+    elif sho == 4:
+        shn = 15
+    elif sho == 6:
+        shn = 28
+    elif sho == 8:
+        shn = 46
+    else:
+        raise ValueError(f"dmri_rishes: unexptected sho: {sho}")
+
+    if norm:
+        # normalize using b=0 images if requested
+        rish_args = f'-normalise -shells 0,{b}'
+
+    else:
+        rish_args = f'-shells {b}'
+
+    # Calculate coefficients up to order specified
+    sp.run('$MRTRIXDIR/bin/amp2sh -quiet'
+          f' -fslgrad {bvec_fn} {bval_fn} -bvalue_scaling false'
+          f' -lmax {sho} {rish_args}'
+          f' {nii_fn} {sh_fn}',
+           shell=True, check=True)
+
+    # amp2sh notes
+    # - using -normalise with -shells 0,1000 makes the l=2 RISH look much more like
+    #   an FA map, with noisy background pixels; leaving normalise off gives a nice and
+    #   dark background. Including the '0' shell without -normalise has no effect
+    # - can only use one shell at a time
+    # - b=1000 l=0 RISH looks much more flat (no GM/WM) contrast when normalized, compared
+    #   to the b=2500 l=0 RISH, which has some contrast there
+    # - b=1000 l=2 RISH looks similar to b=2500 l=2 RISH, except that the higher b-val RISH
+    #   has much more noise; the normalized versions have minor differences in specific areas
+
+
+    # Split sharmX image
+    sp.run(f'$FSLDIR/bin/fslsplit {sh_fn} {tmpd}/sh_ -t',
+           shell=True, check=True)
+
+    # Retrieve mapping of SH to vol number
+    # src_path = os.path.join(os.path.dirname(sys.path[0]), 'src')
+    # lut = pd.read_csv(src_path + '/' + 'sharm_split_sh_mapping_tol8.txt',
+    #                   sep=' ', header=None, index_col=0, names=['SH'])
+    lut = sh_mapping_lut()
+
+    # give split vols meaningful labels
+    for k in range(shn):
+        fn = f'{tmpd}/sh_{k:04d}.{nii_suff}'
+        sh_lab = 'sh_' + lut.loc[k, 'SH']
+
+        shutil.move(fn, fn.replace(f'sh_{k:04d}', sh_lab))
+
+
+    # Sum of squares of all phases from an order to get rishes
+    sh_orders = range(0, sho+1, 2)
+    rish_fns = [nii_prefix + f'-rish_l{x}.{nii_suff}' for x in sh_orders]
+    rish_data = np.zeros(nii.shape[0:3] + (len(sh_orders),))
+
+    for k, sh_ord in enumerate(sh_orders):
+        for fn in glob(fr'{tmpd}/sh_l{sh_ord}m*.{nii_suff}'):
+            ph_img = nib.load(fn).get_fdata()
+            rish_data[..., k] += ph_img**2
+
+            os.remove(fn)
+
+        # write out rish images
+        du.make_nii(rish_data[..., k], new_aff=nii.affine).to_filename(rish_fns[k])
+
+    # clean up
+    shutil.rmtree(tmpd)
+
+
+def sh_mapping_lut():
+    """Generate the mapping of volume numbers to order and phase of SH.
+    """
+
+    sh_op_array = np.array(['l0m0',
+                            'l2m-2', 'l2m-1', 'l2m0', 'l2m+1', 'l2m+2',
+                            'l4m-4', 'l4m-3', 'l4m-2', 'l4m-1', 'l4m0', 'l4m+1', 'l4m+2', 'l4m+3', 'l4m+4',
+                            'l6m-6', 'l6m-5', 'l6m-4', 'l6m-3', 'l6m-2', 'l6m-1', 'l6m0', 'l6m+1', 'l6m+2', 'l6m+3', 'l6m+4', 'l6m+5', 'l6m+6',
+                            'l8m-8', 'l8m-7', 'l8m-6', 'l8m-5', 'l8m-4', 'l8m-3', 'l8m-2', 'l8m-1', 'l8m0', 'l8m+1', 'l8m+2', 'l8m+3', 'l8m+4', 'l8m+5', 'l8m+6', 'l8m+7', 'l8m+8'])
+
+    lut = pd.DataFrame(data={'SH': sh_op_array})
+
+    return lut
+
+
+# Entry point
+if __name__ == '__main__':
+
+    # Parse args
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+
+    parser.add_argument('nii_fn', help="4D Nifti files of raw T2-weighted and DW volumes")
+    parser.add_argument('sho', help="Maximum spherical harmonic order to calculate (0,2,4,6,8)")
+    parser.add_argument('-b', default=1000, help="b-value of non-zero shell to use (default 1000)")
+    parser.add_argument('--norm', action='store_true', help="Normalize using the b=0 images")
+
+    args = parser.parse_args()
+
+    # Check args, load nii
+    nii = du.check_load_nii(args.nii_fn)
+
+    # Run
+    main(nii, int(args.sho), b=int(args.b), norm=args.norm)
+

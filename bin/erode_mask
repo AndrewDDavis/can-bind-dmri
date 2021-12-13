@@ -6,7 +6,7 @@
 #   keep a consistent kernel and erode the top and bottom slices as well.
 
 # Options:
-#   sz -- kernel size in mm (isotropic)
+#   sz -- kernel size in mm (isotropic box)
 #    n -- number of times to erode mask
 
 # Usage: erode_mask mask.nii sz n
@@ -60,5 +60,3 @@ while [[ $ero_cnt -lt $n ]]; do
     ((ero_cnt++))
 done
 
-# outfile="${in_pref}"-ero1.${out_ext}
-# /bin/mv -i "${outfile}" "${outfile/ero1/ero}"

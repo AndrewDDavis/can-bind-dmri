@@ -1,0 +1,106 @@
+#!/bin/bash
+
+# Run this on Graham to start dmasks jobs
+
+# Arg defaults and parsing
+dry_run=False
+vis_list=()
+
+while [[ $# -gt 0 ]]; do
+    if [[ "$1" == '-n' ]]; then
+        dry_run=True
+        shift
+    else
+        vis_list=($1)
+        shift
+    fi
+done
+
+
+# CB-DTI project
+cd ~/project/davisad/CAN-BIND_DTI
+export PWD
+
+# Ensure FSL is available
+if ! which fsl > /dev/null 2>&1; then
+    echo "FSL not found"
+    exit 2
+elif [[ "$FSLDIR" != /home/davisad/fsl ]]; then
+    echo "FSLDIR incorrect"
+    exit 2
+fi
+
+# Locate dwi_merged niis to be run
+echo "Locating dwi_merged files..."
+if [[ ${#vis_list[@]} -gt 0 ]]; then
+    files_arr=()
+    for v in "${vis_list[@]}"; do
+        files_arr+=($(find 'data/subprojects/' -wholename "*/$v/dti_preprocessed/dwi_merged.nii.gz" -print))
+    done
+else
+    files_arr=($(find 'data/subprojects/' -wholename '*/*/dti_preprocessed/dwi_merged.nii.gz' -print | sort))
+fi
+
+if [[ ${#files_arr[@]} -eq 0 ]]; then
+    echo "No files found"
+    exit 2
+else
+    echo "Found ${#files_arr[@]} files"
+    start_time=$(date '+%H:%M')
+fi
+
+# Add dmasks job to the Graham scheduler
+for f in "${files_arr[@]}"; do
+
+    # e.g. f -> data/subprojects/CAM_B/CAM_0006_01/dti_preprocessed/dwi_merged.nii.gz
+    new_path="${f%/dwi_merged.nii.gz}"
+    new_vid=$(printf $f | cut -d '/' -f 4)
+
+    # check for run already started
+    if [[ -n "$(find "${new_path}" -maxdepth 1 -name 'dwi_dmasks-*.out' -print -quit)" ]]; then
+        echo "sbatch output file exists; skipping ${new_path}"
+        continue
+    elif [[ -d "${new_path}/dwi_dmasks" ]]; then
+        echo "dwi_dmasks dir exists; skipping ${new_path}"
+        continue
+    fi
+
+
+    # make a copy of the generic job and edit it
+    cp -f ~/bin/sn_dmasks_indiv_job ~/bin/sn_dmasks_indiv_job_working
+
+    sed --in-place "s:dummy_path:${new_path}:g" ~/bin/sn_dmasks_indiv_job_working
+    sed --in-place "s/dummy_vid/${new_vid}/" ~/bin/sn_dmasks_indiv_job_working
+
+    # UCA_A jobs need a *lot* more memory
+    # Check for 128 or 256 resolution, allocate more
+    res=$(fslval $f dim1)
+    if [[ $res -eq 128 ]]; then
+        sed --in-place "s/mem_mb/1710/" ~/bin/sn_dmasks_indiv_job_working
+        sed --in-place "s/time_limit/01:20:00/" ~/bin/sn_dmasks_indiv_job_working
+    elif [[ $res -eq 256 ]]; then
+        sed --in-place "s/mem_mb/6800/" ~/bin/sn_dmasks_indiv_job_working
+        sed --in-place "s/time_limit/05:20:00/" ~/bin/sn_dmasks_indiv_job_working
+    else
+        sed --in-place "s/mem_mb/1280/" ~/bin/sn_dmasks_indiv_job_working
+        sed --in-place "s/time_limit/00:45:00/" ~/bin/sn_dmasks_indiv_job_working
+    fi
+
+    # schedule the job
+    if [[ $dry_run == True ]]; then
+        echo "Would submit job for ${new_path}"
+    else
+        echo "Submitting job for ${new_path}"
+        sbatch ~/bin/sn_dmasks_indiv_job_working
+    fi
+
+    rm ~/bin/sn_dmasks_indiv_job_working
+
+    # don't overwhelm the scheduler
+    sleep 1
+done
+
+echo "Done"
+echo "Monitor jobs with: squeue -u $USER -t all"
+echo "and/or: sacct --format='JobID,JobName%15,State,ExitCode,Timelimit,Elapsed,NCPUS,TotalCPU,ReqMem,MaxRSS' -S ${start_time}"
+

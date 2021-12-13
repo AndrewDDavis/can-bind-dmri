@@ -1,0 +1,62 @@
+#!/bin/bash
+
+# Calculate RD from eigenvalues created with dti_preprocess
+# Run this from an exam directory with a dmripp dir in it, or
+# provide the options below
+
+# v0.4 (Jan 2021) by Andrew Davis (addavis@gmail.com)
+
+
+function print_doc {
+cat << EOF
+
+$(basename $0)
+-----------
+
+Calculate RD from eigenvalue images
+
+By default looks in subdirectory dmripp for files like wdt_L1.
+
+Requires:
+- FSL (https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/FslInstallation)
+
+Options:
+    --dt_pref <path>  : basename of input files (e.g. foo/bar/kdt)
+
+Outputs:
+    {dt_pref}_RD : nifti file with RD values per voxel
+
+Example:
+    cd MCU_0051_01
+    dti_calc_RD
+
+EOF
+}
+
+# Robustness
+set -o nounset
+set -o errexit
+set -o pipefail
+
+# Defaults
+dt_pref=dmripp/wdt
+
+# Parse args
+[[ $1 == -h ]] || [[ $1 == --help ]] && { print_doc; exit 0; }
+while [ $# -gt 0 ]; do
+    case $1 in
+      --dt_pref ) dt_pref="$2"; shift;;
+              * ) echo "Unrecognized option '$1'"; print_doc; exit 1;;
+    esac
+    shift
+done
+
+# Check for expected files
+[[ $($FSLDIR/bin/imtest "${dt_pref}_L1") == 1 ]] || { echo "Error: ${dt_pref}_L1 not found from ${PWD}"; exit 2; }
+
+# Calculate RD from L2 and L3
+fslmaths "${dt_pref}_L2" \
+    -add "${dt_pref}_L3" \
+    -div 2 \
+    "${dt_pref}_RD"
+

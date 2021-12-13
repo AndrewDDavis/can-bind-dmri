@@ -1,0 +1,325 @@
+#!/usr/bin/env bash
+
+# This script will extract relevant stats from the various nontensor models runs with different
+# burn-in and parameters.
+
+set -o errexit -o nounset -o pipefail
+
+cd ~/Documents/Research_Projects/CAN-BIND_DTI/data/nontensor_models_analysis
+
+if [[ $# -eq 1 ]]; then
+    dmripp_dirs=($1)
+else
+    dmripp_dirs=($(find * -wholename '*/dmripp'))
+fi
+
+for dmripp_dir in ${dmripp_dirs[@]}; do
+
+    # Sanity checks
+    [[ -e $dmripp_dir/mask-fine_brain.nii.gz ]] \
+      || { echo "Error: mask-fine_brain not found in ${dmripp_dir}."; exit 2; }
+
+    echo "Working in ${dmripp_dir}..."
+    cd $dmripp_dir
+
+
+    # Check for WM mask
+    if [[ -e wm_mask.nii.gz ]]; then
+        echo "  wm_mask exists in ${dmripp_dir}; Skipping mask creation."
+    else
+        fslmaths mask-fine_brain \
+                 -kernel sphere 5.0 -ero \
+                 mask_ero
+
+        unzip -q biasx_seg.zip biasx_seg/t2w_biasx_pve_2.nii.gz
+
+        fslmaths wdt/wdt_FA \
+                 -mul mask_ero -thr 0.15 -bin \
+                 -add biasx_seg/t2w_biasx_pve_2 -thr 1.5 -bin \
+                 wm_mask
+
+        /bin/rm biasx_seg/t2w_biasx_pve_2.nii.gz \
+          && /bin/rmdir biasx_seg
+    fi
+
+
+    # Extract stats to a file
+    outfile=dmri_model_stats.csv
+
+    if [[ -e $outfile ]]; then
+        echo "  $outfile exists in $dmripp_dir. Moving on..."
+    else
+
+        echo "params,time_spv,time_spv_std,time_spv_vals,f1_mean_wm,f1_std_wm,f1_vals_wm,f2_mean_wm,f2_std_wm,f2_vals_wm,fsum_mean_wm,fsum_std_wm,fsum_vals_wm,d_mean_wm,d_std_wm,d_vals_wm,d1disp_mean_wm,d1disp_std_wm,d1disp_vals_wm,d2disp_mean_wm,d2disp_std_wm,d2disp_vals_wm,f1_mean_br,f1_std_br,f1_vals_br,f2_mean_br,f2_std_br,f2_vals_br,fsum_mean_br,fsum_std_br,fsum_vals_br,d_mean_br,d_std_br,d_vals_br,d1disp_mean_br,d1disp_std_br,d1disp_vals_br,d2disp_mean_br,d2disp_std_br,d2disp_vals_br,d_modelstd_br" > $outfile
+
+        FA_mean_wm=$(fslstats wdt/wdt_FA -k wm_mask -m | tr -d '[:blank:]')
+        FA_mean_br=$(fslstats wdt/wdt_FA -k mask_ero -m | tr -d '[:blank:]')
+        MD_mean_wm=$(fslstats wdt/wdt_MD -k wm_mask -m | tr -d '[:blank:]')
+        MD_mean_br=$(fslstats wdt/wdt_MD -k mask_ero -m | tr -d '[:blank:]')
+
+        # put Frob-norm values into d1disp columns
+        FN_mean_wm=$(fslstats wdt/wdt_FrobNorm -k wm_mask -m | tr -d '[:blank:]')
+        FN_mean_br=$(fslstats wdt/wdt_FrobNorm -k mask_ero -m | tr -d '[:blank:]')
+
+        echo "tensor,,,,,,,,,,${FA_mean_wm},,,${MD_mean_wm},,,${FN_mean_wm},,,,,,,,,,,,${FA_mean_br},,,${MD_mean_br},,,${FN_mean_br},,,,,," >> $outfile
+
+        statdir=dmri_model_stat_images
+        [[ -d $statdir ]] && /bin/rm -r $statdir
+        mkdir -p $statdir
+
+        for d in $(find * -maxdepth 1 -name 'ntmod_*.bedpostX-A' -type d | sort -V); do
+
+            # basename of dir
+            d_bn=${d:0:(-2)}
+            params=${d_bn%.bedpostX}
+
+
+            # Processing time per voxel
+            # Just use the middle slice as a surrogate for the brain to check timing, since the overall timing gets complicated by no. of processors used
+            slc=26      # 0-indexed, while other logs are 1-indexed
+            unzip -q $d/bedpostx_logs.zip logs/log00${slc}
+            vox_cnt=$(($(wc -l logs/log00${slc} | cut -d ' ' -f 1) - 1))
+            /bin/rm logs/log00${slc}
+
+            # mean for 5 or 8 runs
+            mtimes=""
+            runct=0
+            for dd in ${d_bn}-[A-H]; do
+                unzip -qo $dd/bedpostx_logs.zip "logs/bedpostx.[eo][0-9]*.$((slc+1))"
+                stime=$(stat -c '%Y' logs/bedpostx.e*.$((slc+1)))
+                etime=$(stat -c '%Y' logs/bedpostx.o*.$((slc+1)))
+
+                mtimes+="$((etime-stime)),"
+                runct=$((runct+1))
+
+                /bin/rm logs/bedpostx.[eo]*.$((slc+1))
+            done
+            /bin/rmdir logs
+
+            proctime_spv=$(python -c "print('{:0.4f}'.format(sum([$mtimes])/(${runct}*${vox_cnt}.)))")
+            proctime_spv_std=$(python -c "import numpy as np; print('{:0.4f}'.format(np.std([$mtimes], ddof=1)/${vox_cnt}.))")
+            proctime_spv_vals=$(python3 -c "print(', '.join(f'{l/${vox_cnt}.:.4f}' for l in [$mtimes]))")
+
+
+            # Merge the f and d images for the 5 or 8 trial runs (A-E/A-H) and create mean and std images across trials
+            fslmerge -t ${statdir}/${params}-f1_merged ${d_bn}-[A-H]/mean_f1samples.nii.gz
+            fslmerge -t ${statdir}/${params}-fsum_merged ${d_bn}-[A-H]/mean_fsumsamples.nii.gz
+            fslmerge -t ${statdir}/${params}-d_merged ${d_bn}-[A-H]/mean_dsamples.nii.gz
+            fslmerge -t ${statdir}/${params}-d1disp_merged ${d_bn}-[A-H]/dyads1_dispersion.nii.gz
+            [[ $params == *_n2_* ]] \
+              && fslmerge -t ${statdir}/${params}-f2_merged ${d_bn}-[A-H]/mean_f2samples.nii.gz \
+              && fslmerge -t ${statdir}/${params}-d2disp_merged ${d_bn}-[A-H]/dyads2_dispersion.nii.gz
+
+            fslmaths ${statdir}/${params}-f1_merged -Tmean ${statdir}/${params}-f1_mean
+            fslmaths ${statdir}/${params}-f1_merged -Tstd ${statdir}/${params}-f1_std
+            fslmaths ${statdir}/${params}-fsum_merged -Tmean ${statdir}/${params}-fsum_mean
+            fslmaths ${statdir}/${params}-fsum_merged -Tstd ${statdir}/${params}-fsum_std
+            fslmaths ${statdir}/${params}-d_merged -Tmean ${statdir}/${params}-d_mean
+            fslmaths ${statdir}/${params}-d_merged -Tstd ${statdir}/${params}-d_std
+            fslmaths ${statdir}/${params}-d1disp_merged -Tmean ${statdir}/${params}-d1disp_mean
+            fslmaths ${statdir}/${params}-d1disp_merged -Tstd ${statdir}/${params}-d1disp_std
+
+            [[ $params == *_n2_* ]] \
+              && fslmaths ${statdir}/${params}-f2_merged -Tmean ${statdir}/${params}-f2_mean \
+              && fslmaths ${statdir}/${params}-f2_merged -Tstd ${statdir}/${params}-f2_std \
+              && fslmaths ${statdir}/${params}-d2disp_merged -Tmean ${statdir}/${params}-d2disp_mean \
+              && fslmaths ${statdir}/${params}-d2disp_merged -Tstd ${statdir}/${params}-d2disp_std
+
+
+            # Extract f and d stats for WM and whole-brain
+            f1_mean_wm=$(fslstats ${statdir}/${params}-f1_mean -k wm_mask -m | tr -d '[:blank:]')
+            f1_std_wm=$(fslstats ${statdir}/${params}-f1_std -k wm_mask -m | tr -d '[:blank:]')
+            f1_vals_wm=$(fslmeants -i ${statdir}/${params}-f1_merged -m wm_mask | tr -d '[:blank:]' | tr -s '\n' ',')
+            fsum_mean_wm=$(fslstats ${statdir}/${params}-fsum_mean -k wm_mask -m | tr -d '[:blank:]')
+            fsum_std_wm=$(fslstats ${statdir}/${params}-fsum_std -k wm_mask -m | tr -d '[:blank:]')
+            fsum_vals_wm=$(fslmeants -i ${statdir}/${params}-fsum_merged -m wm_mask | tr -d '[:blank:]' | tr -s '\n' ',')
+            d_mean_wm=$(fslstats ${statdir}/${params}-d_mean -k wm_mask -m | tr -d '[:blank:]')
+            d_std_wm=$(fslstats ${statdir}/${params}-d_std -k wm_mask -m | tr -d '[:blank:]')
+            d_vals_wm=$(fslmeants -i ${statdir}/${params}-d_merged -m wm_mask | tr -d '[:blank:]' | tr -s '\n' ',')
+            d1disp_mean_wm=$(fslstats ${statdir}/${params}-d1disp_mean -k wm_mask -m | tr -d '[:blank:]')
+            d1disp_std_wm=$(fslstats ${statdir}/${params}-d1disp_std -k wm_mask -m | tr -d '[:blank:]')
+            d1disp_vals_wm=$(fslmeants -i ${statdir}/${params}-d1disp_merged -m wm_mask | tr -d '[:blank:]' | tr -s '\n' ',')
+
+            if [[ $params == *_n2_* ]]; then
+                f2_mean_wm=$(fslstats ${statdir}/${params}-f2_mean -k wm_mask -m | tr -d '[:blank:]')
+                f2_std_wm=$(fslstats ${statdir}/${params}-f2_std -k wm_mask -m | tr -d '[:blank:]')
+                f2_vals_wm=$(fslmeants -i ${statdir}/${params}-f2_merged -m wm_mask | tr -d '[:blank:]' | tr -s '\n' ',')
+                d2disp_mean_wm=$(fslstats ${statdir}/${params}-d2disp_mean -k wm_mask -m | tr -d '[:blank:]')
+                d2disp_std_wm=$(fslstats ${statdir}/${params}-d2disp_std -k wm_mask -m | tr -d '[:blank:]')
+                d2disp_vals_wm=$(fslmeants -i ${statdir}/${params}-d2disp_merged -m wm_mask | tr -d '[:blank:]' | tr -s '\n' ',')
+            else
+                f2_mean_wm=""
+                f2_std_wm=""
+                f2_vals_wm=""
+                d2disp_mean_wm=""
+                d2disp_std_wm=""
+                d2disp_vals_wm=""
+            fi
+
+            f1_mean_br=$(fslstats ${statdir}/${params}-f1_mean -k mask_ero -m | tr -d '[:blank:]')
+            f1_std_br=$(fslstats ${statdir}/${params}-f1_std -k mask_ero -m | tr -d '[:blank:]')
+            f1_vals_br=$(fslmeants -i ${statdir}/${params}-f1_merged -m mask_ero | tr -d '[:blank:]' | tr -s '\n' ',')
+            fsum_mean_br=$(fslstats ${statdir}/${params}-fsum_mean -k mask_ero -m | tr -d '[:blank:]')
+            fsum_std_br=$(fslstats ${statdir}/${params}-fsum_std -k mask_ero -m | tr -d '[:blank:]')
+            fsum_vals_br=$(fslmeants -i ${statdir}/${params}-fsum_merged -m mask_ero | tr -d '[:blank:]' | tr -s '\n' ',')
+            d_mean_br=$(fslstats ${statdir}/${params}-d_mean -k mask_ero -m | tr -d '[:blank:]')
+            d_std_br=$(fslstats ${statdir}/${params}-d_std -k mask_ero -m | tr -d '[:blank:]')
+            d_vals_br=$(fslmeants -i ${statdir}/${params}-d_merged -m mask_ero | tr -d '[:blank:]' | tr -s '\n' ',')
+            d1disp_mean_br=$(fslstats ${statdir}/${params}-d1disp_mean -k mask_ero -m | tr -d '[:blank:]')
+            d1disp_std_br=$(fslstats ${statdir}/${params}-d1disp_std -k mask_ero -m | tr -d '[:blank:]')
+            d1disp_vals_br=$(fslmeants -i ${statdir}/${params}-d1disp_merged -m mask_ero | tr -d '[:blank:]' | tr -s '\n' ',')
+
+            if [[ $params == *_n2_* ]]; then
+                f2_mean_br=$(fslstats ${statdir}/${params}-f2_mean -k mask_ero -m | tr -d '[:blank:]')
+                f2_std_br=$(fslstats ${statdir}/${params}-f2_std -k mask_ero -m | tr -d '[:blank:]')
+                f2_vals_br=$(fslmeants -i ${statdir}/${params}-f2_merged -m mask_ero | tr -d '[:blank:]' | tr -s '\n' ',')
+                d2disp_mean_br=$(fslstats ${statdir}/${params}-d2disp_mean -k mask_ero -m | tr -d '[:blank:]')
+                d2disp_std_br=$(fslstats ${statdir}/${params}-d2disp_std -k mask_ero -m | tr -d '[:blank:]')
+                d2disp_vals_br=$(fslmeants -i ${statdir}/${params}-d2disp_merged -m mask_ero | tr -d '[:blank:]' | tr -s '\n' ',')
+            else
+                f2_mean_br=""
+                f2_std_br=""
+                f2_vals_br=""
+                d2disp_mean_br=""
+                d2disp_std_br=""
+                d2disp_vals_br=""
+            fi
+
+            # For m2 and m3 models, also grab the mean of d_std
+            if [[ $d == *_m[23]_* ]]; then
+                fslmerge -t ${statdir}/${params}-d_modelstd_merged ${d_bn}-[A-H]/mean_d_stdsamples.nii.gz
+                fslmaths ${statdir}/${params}-d_modelstd_merged -Tmean ${statdir}/${params}-d_modelstd_mean
+                d_modelstd_br=$(fslstats ${statdir}/${params}-d_modelstd_mean -k mask_ero -m | tr -d '[:blank:]')
+            else
+                d_modelstd_br=""
+            fi
+
+            # blank line to improve readibility and write outputs in CSV format
+            [[ $params == *n2_b0 ]] \
+              || [[ $params == *n1_b1000 ]] \
+              && echo "" >> "$outfile"
+
+            echo "${params},${proctime_spv},${proctime_spv_std},\"${proctime_spv_vals}\",${f1_mean_wm},${f1_std_wm},\"${f1_vals_wm}\",${f2_mean_wm},${f2_std_wm},\"${f2_vals_wm}\",${fsum_mean_wm},${fsum_std_wm},\"${fsum_vals_wm}\",${d_mean_wm},${d_std_wm},\"${d_vals_wm}\",${d1disp_mean_wm},${d1disp_std_wm},\"${d1disp_vals_wm}\",${d2disp_mean_wm},${d2disp_std_wm},\"${d2disp_vals_wm}\",${f1_mean_br},${f1_std_br},\"${f1_vals_br}\",${f2_mean_br},${f2_std_br},\"${f2_vals_br}\",${fsum_mean_br},${fsum_std_br},\"${fsum_vals_br}\",${d_mean_br},${d_std_br},\"${d_vals_br}\",${d1disp_mean_br},${d1disp_std_br},\"${d1disp_vals_br}\",${d2disp_mean_br},${d2disp_std_br},\"${d2disp_vals_br}\",${d_modelstd_br}" >> "$outfile"
+        done
+
+        # clean up
+        /bin/rm -r $statdir
+
+        # copy output CSV to group_results for further processing
+        # Next ran nontensor_model_plots.py in model_comparison_plots directory group_results/
+        subj_id=${dmripp_dir%/dmripp}
+        /bin/cp "$outfile" \
+                ~/Dropbox/Research_Projects/CAN-BIND_DTI/group_results/nontensor_models_analysis/${outfile/.csv/-${subj_id}.csv}
+    fi
+
+    # # Check for ACR mask (crossing fibres region)
+    # if [[ -e acr_mask.nii.gz ]]; then
+    #     echo "  extracting ACR stats..."
+
+    #     outfile_acr=dmri_model_stats_acr.csv
+
+    #     echo "params,fsum_mean_acr,fsum_std_acr,d_mean_acr,d_std_acr" > ${outfile_acr}
+
+    #     FA_mean_acr=$(fslstats wdt/wdt_FA -k acr_mask -m | tr -d '[:blank:]')
+    #     MD_mean_acr=$(fslstats wdt/wdt_MD -k acr_mask -m | tr -d '[:blank:]')
+
+    #     echo "tensor,${FA_mean_acr},,${MD_mean_acr}," >> ${outfile_acr}
+
+    #     statdir=dmri_model_stat_images
+    #     [[ -d $statdir ]] && /bin/rm -r $statdir
+    #     mkdir -p $statdir
+
+    #     for d in $(find * -maxdepth 1 -name 'ntmod_*_b1000.bedpostX-A' -type d | sort -V); do
+
+    #         # basename of dir
+    #         d_bn=${d:0:(-2)}
+    #         params=${d_bn%.bedpostX}
+
+    #         # Merge the f and d images for the 5 or 8 trial runs (A-E/A-H) and create mean and std images across trials
+    #         fslmerge -t ${statdir}/${params}-fsum_merged ${d_bn}-[A-H]/mean_fsumsamples.nii.gz
+    #         fslmerge -t ${statdir}/${params}-d_merged ${d_bn}-[A-H]/mean_dsamples.nii.gz
+
+    #         fslmaths ${statdir}/${params}-fsum_merged -Tmean ${statdir}/${params}-fsum_mean
+    #         fslmaths ${statdir}/${params}-fsum_merged -Tstd ${statdir}/${params}-fsum_std
+    #         fslmaths ${statdir}/${params}-d_merged -Tmean ${statdir}/${params}-d_mean
+    #         fslmaths ${statdir}/${params}-d_merged -Tstd ${statdir}/${params}-d_std
+
+    #         # Extract f and d stats for ACR
+    #         fsum_mean_acr=$(fslstats ${statdir}/${params}-fsum_mean -k acr_mask -m | tr -d '[:blank:]')
+    #         fsum_std_acr=$(fslstats ${statdir}/${params}-fsum_std -k acr_mask -m | tr -d '[:blank:]')
+    #         d_mean_acr=$(fslstats ${statdir}/${params}-d_mean -k acr_mask -m | tr -d '[:blank:]')
+    #         d_std_acr=$(fslstats ${statdir}/${params}-d_std -k acr_mask -m | tr -d '[:blank:]')
+
+    #         echo "${params},${fsum_mean_acr},${fsum_std_acr},${d_mean_acr},${d_std_acr}" >> ${outfile_acr}
+    #     done
+
+    #     /bin/rm -r $statdir
+
+    #     subj_id=${dmripp_dir%/dmripp}
+    #     /bin/cp ${outfile_acr} \
+    #             ~/Dropbox/Research_Projects/CAN-BIND_DTI/group_results/nontensor_models_analysis/${outfile_acr/.csv/-${subj_id}.csv}
+    # fi
+
+    # Check for MO by FA masks (highly linear and planar WM masks)
+    if [[ -e mask-planar_anis.nii.gz ]]; then
+        echo "  extracting collinear and planar stats..."
+
+        outfile_linpla=dmri_model_stats_linpla.csv
+
+        echo "params,fsum_mean_col,fsum_std_col,d_mean_col,d_std_col,fsum_mean_pla,fsum_std_pla,d_mean_pla,d_std_pla" > ${outfile_linpla}
+
+        FA_mean_col=$(fslstats wdt/wdt_FA -k mask-linear_anis -m | tr -d '[:blank:]')
+        MD_mean_col=$(fslstats wdt/wdt_MD -k mask-linear_anis -m | tr -d '[:blank:]')
+        FA_mean_pla=$(fslstats wdt/wdt_FA -k mask-planar_anis -m | tr -d '[:blank:]')
+        MD_mean_pla=$(fslstats wdt/wdt_MD -k mask-planar_anis -m | tr -d '[:blank:]')
+
+        echo "tensor,${FA_mean_col},,${MD_mean_col},,${FA_mean_pla},,${MD_mean_pla}," >> ${outfile_linpla}
+
+        statdir=dmri_model_stat_images
+        [[ -d $statdir ]] && /bin/rm -r $statdir
+        mkdir -p $statdir
+
+        for d in $(find * -maxdepth 1 -name 'ntmod_*_b1000.bedpostX-A' -type d | sort -V); do
+
+            # basename of dir
+            d_bn=${d:0:(-2)}
+            params=${d_bn%.bedpostX}
+
+            # Merge the f and d images for the 5 or 8 trial runs (A-E/A-H) and create mean and std images across trials
+            fslmerge -t ${statdir}/${params}-fsum_merged ${d_bn}-[A-H]/mean_fsumsamples.nii.gz
+            fslmerge -t ${statdir}/${params}-d_merged ${d_bn}-[A-H]/mean_dsamples.nii.gz
+
+            fslmaths ${statdir}/${params}-fsum_merged -Tmean ${statdir}/${params}-fsum_mean
+            fslmaths ${statdir}/${params}-fsum_merged -Tstd ${statdir}/${params}-fsum_std
+            fslmaths ${statdir}/${params}-d_merged -Tmean ${statdir}/${params}-d_mean
+            fslmaths ${statdir}/${params}-d_merged -Tstd ${statdir}/${params}-d_std
+
+            # Extract f and d stats for col and pla regions
+            fsum_mean_col=$(fslstats ${statdir}/${params}-fsum_mean -k mask-linear_anis -m | tr -d '[:blank:]')
+            fsum_std_col=$(fslstats ${statdir}/${params}-fsum_std -k mask-linear_anis -m | tr -d '[:blank:]')
+            d_mean_col=$(fslstats ${statdir}/${params}-d_mean -k mask-linear_anis -m | tr -d '[:blank:]')
+            d_std_col=$(fslstats ${statdir}/${params}-d_std -k mask-linear_anis -m | tr -d '[:blank:]')
+            fsum_mean_pla=$(fslstats ${statdir}/${params}-fsum_mean -k mask-planar_anis -m | tr -d '[:blank:]')
+            fsum_std_pla=$(fslstats ${statdir}/${params}-fsum_std -k mask-planar_anis -m | tr -d '[:blank:]')
+            d_mean_pla=$(fslstats ${statdir}/${params}-d_mean -k mask-planar_anis -m | tr -d '[:blank:]')
+            d_std_pla=$(fslstats ${statdir}/${params}-d_std -k mask-planar_anis -m | tr -d '[:blank:]')
+
+            echo "${params},${fsum_mean_col},${fsum_std_col},${d_mean_col},${d_std_col},${fsum_mean_pla},${fsum_std_pla},${d_mean_pla},${d_std_pla}" >> ${outfile_linpla}
+        done
+
+        # clean up
+        /bin/rm -r $statdir
+
+        # copy output CSV to group_results for further processing
+        # Next ran nontensor_model_plots.py in model_comparison_plots directory group_results/
+        subj_id=${dmripp_dir%/dmripp}
+        /bin/cp ${outfile_linpla} \
+                ~/Dropbox/Research_Projects/CAN-BIND_DTI/group_results/nontensor_models_analysis/${outfile_linpla/.csv/-${subj_id}.csv}
+    fi
+
+    cd - > /dev/null    # back from dmripp_dir
+
+done
+
+echo "Done"
+

@@ -81,6 +81,7 @@ EOF
 sep_b0=False
 diff_frames=68
 run_afni=True
+run_camino=True
 run_dtk=True
 check_vols=True
 downsample_uca=True
@@ -259,7 +260,7 @@ paste -d ' ' ${bvec_files[@]} > ${prep_dir}/dwi_merged.bvec
 
 printf "Done (Merging).\n\n"
 
-# Ensure paramaters for the DTI are as expected 
+# Ensure paramaters for the DTI are as expected
 if [[ $check_vols == True ]]; then
     echo "Checking..."
     diff_bvecs=$((diff_frames*3))
@@ -270,6 +271,8 @@ fi
 
 
 # Eddy current correction (use vol 1 as reference (if it is b=0) as #0 sometimes has artifact)
+# Consider using the new eddy here, with replacement of noisy (voxels? slices?) -- see https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/eddy
+# Make sure to upgrade to 5.0.11 before using this, and leave out the --dont_sep_offs_move and --dont_peas flags
 echo "Eddy current correction..."
 vol0_bval=$(cut -d ' ' -f 1 ${prep_dir}/dwi_merged.bval)
 vol1_bval=$(cut -d ' ' -f 2 ${prep_dir}/dwi_merged.bval)
@@ -321,8 +324,10 @@ for bval in $(cat ${prep_dir}/dwi_merged.bval); do
     fi
     ((k=k+1))
 done
-fslmerge -t ${prep_dir}/t2w_epi_merged ${prep_dir}/dwi_merged-ecc-t2vol*
-fslmaths ${prep_dir}/t2w_epi_merged -Tmean ${prep_dir}/t2w_epi_mean
+fslmerge -t ${prep_dir}/t2w_epi_merged \
+         ${prep_dir}/dwi_merged-ecc-t2vol*
+fslmaths ${prep_dir}/t2w_epi_merged \
+         -Tmean ${prep_dir}/t2w_epi_mean
 [[ $run_afni == True ]] && \
     fslmerge -t ${prep_dir}/dwi_meant2_merged ${prep_dir}/t2w_epi_mean ${prep_dir}/dwi_merged-ecc-dwvol*
 for im in ${prep_dir}/t2w_epi_merged ${prep_dir}/dwi_merged-ecc-t2vol* ${prep_dir}/dwi_merged-ecc-dwvol* ${prep_dir}/dwi_merged-ecc-vol*; do
@@ -330,22 +335,88 @@ for im in ${prep_dir}/t2w_epi_merged ${prep_dir}/dwi_merged-ecc-t2vol* ${prep_di
 done
 printf "Done (T2w image).\n\n"
 
+
+### \/\/\/ move the following to dmri_brainmask and just call that script
+
 # DTI Brain Extraction (f=0.1 gives generous mask)
 echo "Brain Extraction on T2w EPI..."
 bet ${prep_dir}/t2w_epi_mean ${prep_dir}/t2w_epi_mean-brain -f 0.1 -m
 printf "Done (BET).\n\n"
+
+# Further restrict mask to >15% of robust max intensity
+# - this seems to work better than increasing f for epi-distorted brains
+# - also fill holes and erode/dilate to trim islands and protrusions
+
+# Finding the intensity of the ventricles got complicated due to extreme bias-field of e.g. MCU_A/MCU_0025_02
+#   locate COM and go a bit anterior, then use a 35 mm radius sphere to define central roi
+centrev=($(fslstats ${prep_dir}/t2w_epi_mean-brain -k ${prep_dir}/t2w_epi_mean-brain_mask -C))
+yvoxsize=$(fslval ${prep_dir}/t2w_epi_mean-brain pixdim2 | tr -d '[:space:]')
+zvoxsize=$(fslval ${prep_dir}/t2w_epi_mean-brain pixdim3 | tr -d '[:space:]')
+centrev[1]=$(python -c "print(${centrev[1]} + 10./$yvoxsize)")
+centrev[2]=$(python -c "print(${centrev[2]} + 5./$zvoxsize)")
+fslmaths ${prep_dir}/t2w_epi_mean-brain \
+         -mul 0 -add 1 \
+         -roi ${centrev[0]} 1 ${centrev[1]} 1 ${centrev[2]} 1 0 1 \
+         -kernel sphere 35 \
+         -fmean -thr 1e-8 -bin \
+         ${prep_dir}/t2w_epi_mean-central_roi \
+         -odt char
+
+# Estimate robust-max intensity (i.e. ventricles), but if the
+# threshold is too high, use the low robust int estimate
+# e.g. MCU_A/MCU_0025_02 has limits 209 -> 3457, so we can't use 15% (~ 518)
+int_lims=($(fslstats ${prep_dir}/t2w_epi_mean-brain -k ${prep_dir}/t2w_epi_mean-central_roi -r))
+int_thr=$(python -c "print(${int_lims[1]}*0.15)")
+[[ $(python -c "print($int_thr > ${int_lims[0]})") == True ]] && int_thr=${int_lims[0]}
+
+fslmaths ${prep_dir}/t2w_epi_mean-brain \
+         -thr $int_thr \
+         -bin -fillh26 \
+         -kernel sphere 5.0 \
+         -ero -dilD \
+         -mul ${prep_dir}/t2w_epi_mean-brain_mask \
+         ${prep_dir}/t2w_epi_mean-brain_mask \
+         -odt char
+
+# Mostly leave t2w_epi_mean-brain alone so it has a smooth edge for registration
+# purposes, but make sure it's within reason
+fslmaths ${prep_dir}/t2w_epi_mean-brain_mask \
+         -kernel sphere 5.0 \
+         -dilD \
+         ${prep_dir}/t2w_epi_mean-brain_mask-dil \
+         -odt char
+
+fslmaths ${prep_dir}/t2w_epi_mean-brain \
+         -mul ${prep_dir}/t2w_epi_mean-brain_mask-dil \
+         ${prep_dir}/t2w_epi_mean-brain \
+         -odt float
+
+# clean up from the masking operations
+imrm ${prep_dir}/t2w_epi_mean-central_roi ${prep_dir}/t2w_epi_mean-brain_mask-dil
+
+
+### ^^^^^^^
 
 
 # Fitting diffusion tensors (note: probabilistic tractography depends only on output of bedpostx, not dtifit)
 #   Note output units of FSL for diffusivity are mm^2/s
 #   Note2 --wls option seems to make the most difference in areas with poor quality data, not much difference elsewhere
 echo "Fitting diffusion tensors with dtifit..."
-dtifit --sse --wls --save_tensor --data=${prep_dir}/dwi_merged-ecc --out=${prep_dir}/dti-fsl --mask=${prep_dir}/t2w_epi_mean-brain_mask --bvecs=${prep_dir}/dwi_merged.bvec --bvals=${prep_dir}/dwi_merged.bval
+dtifit --sse --wls --save_tensor --data=${prep_dir}/dwi_merged-ecc \
+       --out=${prep_dir}/dti-fsl --mask=${prep_dir}/t2w_epi_mean-brain_mask \
+       --bvecs=${prep_dir}/dwi_merged-eccrot.bvec --bvals=${prep_dir}/dwi_merged.bval
 printf "Done (dtifit).\n\n"
 
+# Explicity name the FSL tensor since the component order is non-standard (Dxx,Dxy,Dxz,Dyy,Dyz,Dzz)
+${FSLDIR}/bin/immv ${prep_dir}/dti-fsl_tensor ${prep_dir}/dti-fsl_tensor-upper
 
-# Fit with AFNI
+# Calculate RD and frobnorm from FSL DTI fit
+dti_calc_FSL_RD
+dti_calc_FSL_frobnorm
+
+
 if [[ $run_afni == True ]]; then
+    # Fit with AFNI
     echo "Fitting diffusion tensors with 3dDWItoDT..."
     bvectrans -i ${prep_dir}/dwi_merged-eccrot.bvec      # Create bvec file suitable for afni (dwi_merged-eccrot-nx3.bvec)
 
@@ -355,6 +426,17 @@ if [[ $run_afni == True ]]; then
     #   http://dti-tk.sourceforge.net/pmwiki/pmwiki.php?n=Documentation.Diffusivity
     printf "Done (3dDWItoDT).\n\n"
 fi
+
+
+if [[ $run_camino == True ]]; then
+    # Fit with Camino
+    echo "Camino fit to be added..."
+    exit 1
+    # camino_modelfit --model ldt_wtd
+    # camino_modelfit --model restore
+    # camino_modelfit --model BallStick
+fi
+
 
 if [[ -n ${anat:-} ]]; then
     # Register anatomical to diffusion space (for underlays)
@@ -397,11 +479,10 @@ if [[ $run_dtk == True ]]; then
     # n.b. NIfTI dictates the tensor in order (xx, yx, yy, zx, zy, zz) (i.e. lower)
     # FSL outputs the tensor in order (xx, xy, xz, yy, yz, zz) (i.e. upper)
     # see http://groups.google.com/group/dtitk/web/Interoperability+with+major+DTI+tools
-    fslsplit ${prep_dir}/dti-fsl_tensor ${prep_dir}/dti-fsl_DD -t
-    /bin/mv -i ${prep_dir}/dti-fsl_tensor.nii.gz ${prep_dir}/dti-fsl_tensor-upper.nii.gz
+    fslsplit ${prep_dir}/dti-fsl_tensor-upper ${prep_dir}/dti-fsl_DD -t
     fslmerge -t ${prep_dir}/dti-fsl_tensor-lower ${prep_dir}/dti-fsl_DD0000 ${prep_dir}/dti-fsl_DD0001 ${prep_dir}/dti-fsl_DD0003 ${prep_dir}/dti-fsl_DD0002 ${prep_dir}/dti-fsl_DD0004 ${prep_dir}/dti-fsl_DD0005
     /bin/rm ${prep_dir}/dti-fsl_DD*
-    ln -s ./dti-fsl_tensor-lower.nii.gz ${prep_dir}/dti-fsl_tensor.nii.gz  # required naming scheme for dti_tracker
+    ln -s ./dti-fsl_tensor-lower.nii.gz ${prep_dir}/dti-fsl_tensor.nii.gz  # required naming scheme for dti_tracker from Diffusion Toolkit
 
     echo "Generating FSL fibre tracks..."
     angleThresh=60  # Soares says 40-70, have seen 60 used elsewhere...

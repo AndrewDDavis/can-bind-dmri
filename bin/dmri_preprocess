@@ -1,0 +1,1527 @@
+#!/usr/bin/env python3
+# coding: utf-8
+"""This program prepares diffusion MRI data for quantitative analysis. Created for the
+upcoming CAN-BIND manuscript on voxel-wise mode-of-anisotropy data.
+
+_Functionality_
+
+The required argument is a 4D NIfTI image of raw T2-weighted and DW volumes, as
+may be created with dmri_merge. It assumes there are dcm2nii-style bvals and bvecs
+files with the same prefix as the nii. That is, the .bval file is a single-line
+text file with one b-value per volume of nii (including zeros). The .bvec file
+also includes zeros, but has 3 lines for x/y/z components. The further naming
+and details of this are in dmri_merge. For CAN-BIND data, this was run as:
+
+Example
+
+    cd data/subprojects/MCU_B/MCU_0029_01/
+    # optionally run dmri_merge
+    dmri_preprocess dwi_merged.nii
+
+_Environment_
+
+To run fully, this script needs:
+  - installations of FSL (>=6.0.4), MRTrix, and imagemagick
+  - the dmri_utils.py file and other supporting scripts in the same directory (dti_calc_RD, dti_calc_frobnorm,
+dmasks, and dmri_rishes ).
+
+_Processing Steps_
+
+ 0. Read image data, bvals
+ 1. Rough brainmasking with bet, to improve fast bias-corr & registration
+ 2. Noise and Gibbs ringing reduction
+ 3. Estimate and correct for bias-field on all 4D data
+ 4. Registration (custom or eddy)
+ 5. Standardize signal level
+ 6. Touch-up roughmask and create fine-mask
+ 7. Create dw-mean and t2w-mean images
+ 8. Calculate tensor
+ 9. Generate some QC measures
+10. Write out results
+
+For a good review of practical DTI processing considerations see:
+  Soares JM, Marques P, Alves V, Sousa N. A hitchhiker’s guide to diffusion tensor imaging.
+  Frontiers in Neuroscience. 2013;7:31. doi:10.3389/fnins.2013.00031.
+
+For a guide to FSL's diffusion (FDT) tools, see:
+  http://fsl.fmrib.ox.ac.uk/fsl/fslwiki/FDT/UserGuide
+For useful practica, see:
+  FDT & TBSS: http://fsl.fmrib.ox.ac.uk/fslcourse/lectures/practicals/fdt1/
+  Tractography: http://fsl.fmrib.ox.ac.uk/fslcourse/lectures/practicals/fdt2/
+
+_Outputs_
+
+The main outputs go into the same directory as the input nii. Most processing is done in a temp
+directory which is deleted after successful completion of the program.
+
+- dwi_stdpp.nii         This is the preprossed data which can be run through processing pipelines, along with .bval and .bvec
+- mask-rough_brain.nii  Brain mask that includes a generous boundary; useful for registration of T2w scans
+- mask-fine_brain.nii   Brain mask defining a quantitative boundary; useful for scalar maps like FA
+- mean_*.nii            Mean images from DW shells and b=0 shell
+- tissue_seg.zip        Contains segmentation PVE images for CSF/GM/WM and Globus Pallidus, Sub-thalamic nucleus
+- tensor/               Tensor outputs such as scalar maps for each DW shell and all data (with FSL's kurtdir if multishell)
+- qc/                   Useful images and CSV files for quality controls; checking masks, segmentation, plots of
+                          tissue means, SNR, motion
+- dwi_merged.zip        If input nii came from dwi_merge, dwi_merge files are zipped together
+- eddy_iofiles.zip      Files used and produced during motion/eddy correction
+
+_New registration strategy_
+
+This program implements a custom registration strategy that is more sophisticated than
+  eddy_correct, since that registration looked pretty bad. E.g.
+  eddy_correct dwi_merged dwi_merged-ecc2 1 spline
+  The eddy_correct registration visually looks terrible -- introduces nods! Really not good.
+  Also all dwi volumes get inflated by ~ 3%, which seems physically unlikely.
+  Simply using mutualinfo improves the inflation/zooms issue (to half or less), but the nods persist
+  So this scheme is multi step process within/btw t2w and dw images
+  See eddyc_tests/ for intermediate testing files
+"""
+
+__author__ = "Andrew Davis (addavis@gmail.com)"
+__version__ = "0.3 (Jun 2019)"
+__license__ = "Distributed under The MIT License (MIT).  See http://opensource.org/licenses/MIT for details."
+
+
+# TODO
+
+# - test custom reg
+# - test eddy's slice-to-volume movement correction; see if it helps with the banding effect
+#   in the human volunteer from UBC; **need GPU version of eddy (eddy_cuda)**
+# - list all outputs in the main documentation
+# - GUI; single subject and directory search
+# - consider more morph-ops to handle e.g. GM voxels completely enclosed in WM (e.g. semiovale)
+# - also consider using kurt 1/2/3 in tissue segmentation
+
+import sys, os, gc, stat, shutil, gzip, tempfile, pickle
+from os.path import basename, dirname, abspath
+from pathlib import Path    # use p.parts[-1], p.parent, p.resolve(), p.name, p.suffix, p.stem, p.exists, p.glob
+from glob import glob
+from datetime import datetime, timedelta
+import nibabel as nib
+import numpy as np
+import subprocess as sp
+import matplotlib.pyplot as plt
+
+import dmri_utils as du     # dmri_utils.py in same directory as script; sys.path[0] is script directory
+                            # import of du sets tmpd, output_gzip, nogz_env; sets MRTRIXDIR, DMRIDIR
+
+
+def main(nii_path, subjid=None, custom_reg=False, repol=False, hcp=False, db_dir=None, db_seg=False):
+    """Set up data, call secondary functions to do the preprocessing work."""
+
+    if subjid is None:
+        # Guess based on parent directories of nii
+        dn = dirname(abspath(nii_path))
+        while basename(dn).startswith('dmri'):
+            dn = dirname(dn)
+
+        subjid = basename(dn)
+
+    # Read 4D data array with time axis being DW volumes
+    du.nii = du.check_load_nii(nii_path)           # figure out extension and load
+    dwi_merged = du.nii.get_fdata()                # e.g. dwi_merged.shape -> (96, 96, 58, 37)
+    dwi_merged_path = Path(du.nii.get_filename())  # with extension
+    dwi_merged_path_noext = Path(du.get_nii_prefix(dwi_merged_path))
+
+    assert dwi_merged.dtype == np.float_, "Expected float data from nifti."
+    assert len(dwi_merged.shape) == 4,    "Expected 4D data."
+
+    if not hcp:
+        assert dwi_merged.min() == 0.,       f"DWI data has min={dwi_merged.min()}; why? use the --hcp flag for HCP data"
+        # N.B. later processed data sometimes has negatives due to spline/sinc interpolation
+
+    # b-vals as vector
+    bvals_path = dwi_merged_path_noext.with_suffix('.bval')
+    du.bvals = np.genfromtxt(bvals_path)
+
+    assert du.bvals.ndim == 1, f"b-values file should be 1 line or column; got:\n{du.bvals}"
+    assert len(du.bvals) == du.nii.shape[3], f"b-values and volumes should match; have {len(du.bvals)} bvals and {du.nii.shape[3]} volumes"
+
+    # boolean vectors
+    du.t2w_vols = (du.bvals < 0.1)  # handle Philips volumes with b=0.001 etc
+    du.dw_vols = ~du.t2w_vols       # this works because ~ is overloaded for numpy boolean (np.bool_) arrays
+
+    # More subtlety needed if using multiple b-value shells
+    du.nzbvals_uniq = np.unique(du.bvals[du.dw_vols])      # sorted -> [1000, 2500]
+
+    assert np.all(du.nzbvals_uniq == du.nzbvals_uniq.astype(int)), "expected ints for non-zero bvals"
+    du.nzbvals_uniq = du.nzbvals_uniq.astype(int)
+
+    print(f"dmri_preprocess: Found {len(du.nzbvals_uniq)} non-zero diffusion-weighted shells (b={du.nzbvals_uniq})")
+
+    du.dw1_vols = (du.bvals == du.nzbvals_uniq[0])
+
+
+    # b-vecs must also exist
+    bvecs_path = dwi_merged_path_noext.with_suffix('.bvec')
+
+    assert bvecs_path.is_file(), f"File not found: {bvecs_path}"
+
+
+    # Considered re-orienting with fslreorient2std; however, this would require permuting the
+    #   bvecs file in the same way; at the moment it doesn't seem worth the hassle as long as
+    #   everyone is using dcm2nii. Also Rorden discourages this on his mailing list.
+    # Also considered neck removal with robustfov; not necessary in CAN-BIND...
+
+
+    # Define output dir and report/link tmp dir if debugging
+    out_dir = dirname(nii_path)
+
+    if out_dir == '':
+        out_dir = r'.'
+
+    if du.verbose or db_seg or (db_dir is not None):
+        print(f'dmri_preprocess: tmp working directory: {du.tmpd}; creating symlink...', flush=True)
+        os.symlink(f'{du.tmpd}', f'{out_dir}/{basename(du.tmpd)}')
+
+
+    # 1. Rough brain-masking
+    print("dmri_preprocess: (1) Rough initial brain-masking...", flush=True)
+
+    # Masking operations now in dmri_utils
+    # mask comes back as bool
+    roughmask, roughmask_fn, bimod_mask, bimodmask_fn \
+      = du.rough_bbgmasking(dwi_merged, shenv=du.nogz_env)
+
+    dwi_merged = dwi_merged*roughmask[..., None]
+
+
+    # 2. Noise and Gibbs ringing reduction
+    print("dmri_preprocess: (2) Noise and Gibbs ringing reduction...", flush=True)
+
+    dwi_ringx, noise_resid_fns \
+      = reduce_noise_ringing(dwi_merged, dwi_merged_path, roughmask_fn, bimod_mask, db_dir)
+
+
+    # 3. Estimate and correct for bias-field
+    #      apply to all time-points *before* registration
+    #      also applies to noise and residual maps
+    print("dmri_preprocess: (3) Estimating and reducing bias field...", flush=True)
+
+    dwi_biascorr, dwi_biascorr_fn \
+      = du.remove_bias(dwi_ringx, bimod_mask, noise_resid_fns, shenv=du.nogz_env)
+
+
+    # 4. Registration -- custom or eddy
+    print("dmri_preprocess: (4) Within-subject registration...", flush=True)
+    if custom_reg:
+        dwi_emcdata, dwi_emcdata_path, \
+          rbvecs_path, emc_log_fn = custom_dwi_reg(dwi_ringx, dwi_biascorr,
+                                                   roughmask, bvecs_path)
+    else:
+        # free up some memory before calling eddy
+        del dwi_merged, roughmask, dwi_ringx, dwi_biascorr
+        gc.collect()
+
+        dwi_emcdata, dwi_emcdata_path, eddy_dirn \
+          = eddy_reg(dwi_biascorr_fn, roughmask_fn, bvals_path, bvecs_path, repol, db_dir)
+
+        bvals_path = dwi_emcdata_path.with_suffix('.bval')
+        rbvecs_path = dwi_emcdata_path.with_suffix('.bvec')
+
+
+    # 5. Stardardize the signal level
+    print("dmri_preprocess: (5) Standardizing DWI signal level...", flush=True)
+
+    # Make sure dwi_emcdata is in a reasonable range; UBC data values are annoyingly high
+    # Checking 98th percentile of mean b=0 image, we have:
+    #     UBC data: 364980
+    #     MCU data:   3328
+
+    # Previously, used 98th percentile value
+    # highval = np.percentile(t2w_mean, 98)
+    # if highval > 1e5:
+    #     dwi_emcdata /= 100
+
+    # Also previously, used FAST segmentation of T2w volume to get WM mask
+    #    this method failed in cbn15 philips data, as there was not much GM/WM contrast
+
+    # pveseg, pveseg_fn = du.run_fast(dwi_emcdata, du.t2w_vols, op='pveseg')
+    # 0 = outside mask, 1 = CSF, 2 = GM, 3 = WM, 4 = background
+    # wm_level = np.median(t2w_mean[pveseg == 3])
+
+    # Now using RISH images in rough_seg_wm, taking 3 cluster segmentation from RISH 2
+    #   and grabbing the highest valued one as a WM mask
+
+    wm_pve = du.rough_seg_wm(f'{du.tmpd}/{dwi_emcdata_path.stem}', shenv=du.nogz_env)
+
+    # Set median WM level from the T2-w image to 250, so CSF is roughly 1000
+    # Before standardization, e.g. values:
+    #        UBC: 137842
+    #        MCU:   1557
+    t2w_mean = np.mean(dwi_emcdata[..., du.t2w_vols], axis=3)
+    wm_level = np.median(t2w_mean[wm_pve > 0.9])
+
+    std_factor = 250./wm_level
+    dwi_stddata = dwi_emcdata*std_factor
+
+    dwi_stddata_path = Path(f'{du.tmpd}/dwi_stdpp.nii')
+    du.make_nii(dwi_stddata, new_aff=du.nii.affine).to_filename(str(dwi_stddata_path))
+
+    print(" "*4 + f"Original level: {wm_level:0.1f}")
+    print(" "*4 + f"Standardization factor: {std_factor:0.3f}")
+
+
+    # Make sure companion files like noisemap get standardized as well
+    for fn in [noise_resid_fns[i] for i in (0,1,3)]:
+        du.math_op_nii(fn, f'-mul {std_factor}', shenv=du.nogz_env)
+
+
+    # Move companion bvals and bvecs files from emcdata to stddata
+    new_rbvecs_path = dwi_stddata_path.with_suffix('.bvec')
+    rbvecs_path.rename(new_rbvecs_path)
+    rbvecs_path = new_rbvecs_path
+
+    new_bvals_path = dwi_stddata_path.with_suffix('.bval')
+    bvals_path.rename(new_bvals_path)
+    bvals_path = new_bvals_path
+
+
+    # 6. Re-create rough brain-mask and create fine brain-mask for quantitative calculations
+    print("dmri_preprocess: (6) Creating new masks from improved data...", flush=True)
+
+    (roughmask, bimod_mask, finemask, unified_mask), \
+    (roughmask_fn, bimodmask_fn, finemask_fn, unified_mask_fn) \
+      = du.fine_bbgmasking(dwi_stddata, bvals_path, shenv=du.nogz_env, db_seg=db_seg)
+
+    # Re-apply roughmask to dwi_stddata
+    dwi_stddata *= roughmask[..., None]
+    du.make_nii(dwi_stddata, new_aff=du.nii.affine).to_filename(str(dwi_stddata_path))
+
+
+    # 7. Create clean t2w-mean and dw-mean images
+    print("dmri_preprocess: (7) Creating clean dw-mean and t2w-mean images...", flush=True)
+
+    t2w_mean_fn = f'{du.tmpd}/mean_t2w.nii'
+    t2w_mean = np.mean(dwi_stddata[..., du.t2w_vols], axis=3)
+    du.make_nii(t2w_mean, new_aff=du.nii.affine).to_filename(t2w_mean_fn)
+
+    dw_mean_fn = f'{du.tmpd}/mean_dw.nii'
+    dw_mean = np.mean(dwi_stddata[..., du.dw_vols], axis=3)
+    du.make_nii(dw_mean, new_aff=du.nii.affine).to_filename(dw_mean_fn)
+
+    # DW means per shell
+    dw_msmeans = []
+    if len(du.nzbvals_uniq) > 1:
+        for b in du.nzbvals_uniq:
+            tf = (du.bvals == b)
+            dw_mean_sh = np.mean(dwi_stddata[..., tf], axis=3)
+
+            dw_mean_sh_fn = f'{du.tmpd}/mean_dw_b{b}.nii'
+            du.make_nii(dw_mean_sh, new_aff=du.nii.affine).to_filename(dw_mean_sh_fn)
+
+            dw_msmeans.append(dw_mean_sh)
+
+    else:
+        dw_msmeans.append(dw_mean)
+
+
+    # 8. Run FSL's dtifit to calculate tensor and create SSE image
+    print("dmri_preprocess: (8) Fitting tensor(s) and calculating scalar metrics...", flush=True)
+
+    ss_tensor_pps = []
+    if len(du.nzbvals_uniq) > 1:
+
+        # by default, dtifit assumes monoexponential decay; very bad for multishell with b>>1000
+        # --kurt estimates only mean kurtosis (better but not a great model)
+        # --kurtdir estimates kurtosis associated with each of the 3 eigenvalues of the diffusion tensor (K1, K2, and K3)
+        # this makes a huge difference to FA contrast:
+        #   - WM FA values with kurtdir are closer to mono-exponential model than kurt is
+        #   - FA map with kurtdir has much higher contrast than mono-exponential model
+        # adding wls here gives an error; FSL mailing list says the combo is not yet supported
+        print(" "*4 + "minor warning: running kurtdir without wls by necessity in FSL 6.0.4")
+
+        tensor_pp = du.fit_tensor(dwi_stddata_path, finemask_fn, bvals_path, rbvecs_path,
+                                  sse=True, wls=False, save_tensor=True, kurtdir=True, shenv=du.nogz_env)
+
+        # Also run single-shell dti fits with only b=1000 and only b=2500 (or 3000 for HCP)
+        for b in du.nzbvals_uniq:
+
+            pp = du.fit_tensor(dwi_stddata_path, finemask_fn, bvals_path, rbvecs_path,
+                               sse=False, wls=True, save_tensor=True, kurtdir=False,
+                               single_b=b, shenv=du.nogz_env)
+
+            ss_tensor_pps.append(pp)
+
+    else:
+
+        tensor_pp = du.fit_tensor(dwi_stddata_path, finemask_fn, bvals_path, rbvecs_path,
+                                  sse=True, wls=True, save_tensor=True, kurtdir=False, shenv=du.nogz_env)
+
+        ss_tensor_pps.append(tensor_pp)
+
+
+    # Calculate RD and frobnorm metrics
+    calc_pps = [tensor_pp]
+
+    if len(du.nzbvals_uniq) > 1:
+        calc_pps += ss_tensor_pps
+
+    for pp in calc_pps:
+        sp.run(f'$DMRIDIR/dti_calc_RD --dt_pref {pp}',
+            shell=True, check=True, env=du.nogz_env)
+        sp.run(f'$DMRIDIR/dti_calc_frobnorm --dt_pref {pp}',
+            shell=True, check=True, env=du.nogz_env)
+
+
+    # 9. Generate some QC measures
+    print("dmri_preprocess: (9) Segmenting tissues and generating QC measures...", flush=True)
+
+    # make qcdir; on graham cluster, qcdir must get setgid permission for group
+    qcdir = f'{du.tmpd}/qc'
+    os.mkdir(qcdir)
+    mode = os.stat(qcdir).st_mode         # orig permissions
+    os.chmod(qcdir, mode | stat.S_ISGID)  # add setgid
+
+    # Generate images of mask edges on T2w, FA, rough-WM, fine-BBG
+    #   n.b. only finemask images are really needed, since the 'background' image has roughmask applied
+    def mask_check_on_t2(mask_fn, out_str):
+        mask_check(f'{du.tmpd}/mean_t2w', mask_fn,
+                   f'{qcdir}/mask_check-T2w_{out_str}.png')
+
+    mask_check_on_t2(finemask_fn, 'fine_bbg')
+    mask_check_on_t2(bimodmask_fn, 'bimod_bbg')
+
+    bqc = du.nzbvals_uniq[0]
+    mask_check(f'{du.tmpd}/fine_bbgmasking-dtw_b{bqc}_roughmask_FA', finemask_fn,
+               f'{qcdir}/mask_check-rough_FA_fine_bbg.png')
+
+    mask_check(f'{du.tmpd}/fine_bbgmasking-dtw_b{bqc}_mse_xfsm', finemask_fn,
+               f'{qcdir}/mask_check-MSE_fine_bbg.png')
+
+    mask_check(f'{du.tmpd}/dwi_segbbgdata-seg_fast_n3_c3_rsh0_rsh2_mse_pveseg', finemask_fn,
+               f'{qcdir}/seg_check-pveseg_fine_bbg.png')
+
+
+    # Segment finemask into tissues and generate QC image
+    tissue_masks, pve_imgs = du.seg_tissues(dwi_stddata, bimod_mask, shenv=du.nogz_env, db_seg=db_seg)
+
+    mask_check(f'{du.tmpd}/seg_tissues-fast_n3_c3_ent_rish2_rish0_pveseg', finemask_fn,
+               f'{qcdir}/seg_check-tissues_finemask_pveseg.png')
+
+
+    # Log proportions of the image taken up by masks to a log file in QC
+    qc_log_fn = f'{qcdir}/dmripp_mask_sizes.txt'
+    with open(qc_log_fn, 'w') as outf:
+        outf.write("Mask coverages (from hard seg; in percent):\n\n")
+
+        for mask, label in zip((roughmask, bimod_mask, finemask, tissue_masks[0], tissue_masks[1], tissue_masks[2], tissue_masks[3], tissue_masks[4], tissue_masks[5], tissue_masks[6]),
+                               ('Rough brain-mask', 'Bimod brain-mask', 'Fine brain-mask', 'WM mask', 'GM mask', 'CSF mask', 'GP mask', 'STN mask', 'RedN mask', 'Other mask')):
+
+            mask_perc = 100*mask.sum()/np.prod(mask.shape)
+
+            # report 3 sig figs
+            if mask_perc >= 10:
+                fmt = '0.1f'
+            elif mask_perc < 1:
+                fmt = '0.3f'
+            else:
+                fmt = '0.2f'
+
+            outf.write(f"  {label:>16}: {mask_perc:{fmt}}\n")
+
+
+    # Visualize tissue masks
+    tmask_fns = ['CSF_binmask', 'GM_binmask', 'WM_binmask', 'GP_bilatmask', 'STN_bilatmask', 'RedN_bilatmask']
+
+    for i in range(len(tmask_fns)):
+        if np.any(tissue_masks[i]):
+            tmask_fn = f'{du.tmpd}/tissue_seg-{tmask_fns[i]}'
+            tmask_lab = tmask_fns[i].split("_")[0]
+            mask_check_on_t2(tmask_fn, f'tissue_{tmask_lab}')
+
+    # Record FA, MD values from WM/GM/CSF
+    record_tissue_metrics(ss_tensor_pps[0], tissue_masks, pve_imgs, finemask, subjid, qcdir)
+
+
+    # Record motion metrics; these are 'restricted', i.e. excluding the PE direction, so should
+    #   not include eddy current distortions.
+    motpars_path = eddy_dirn / (dwi_emcdata_path.stem + '.eddy_restricted_movement_rms')
+
+    record_motion_metrics(motpars_path, subjid, qcdir)
+
+
+    # Record SNR -- temporal way and mrtrix way
+    record_snr_metrics(pve_imgs, dwi_stddata, noise_resid_fns[0], t2w_mean, dw_msmeans, subjid, qcdir)
+
+
+    # Generate RISH images
+    sp.run(f'$DMRIDIR/dmri_rishes {dwi_stddata_path} 6',
+           shell=True, check=True, env=du.nogz_env)
+
+
+    # Output T2w image series for visual motion check
+    t2w_imgseries_dir = f'{du.tmpd}/raw_t2w_4d'
+    os.mkdir(t2w_imgseries_dir)
+
+    for i in np.nonzero(du.t2w_vols)[0]:
+        sp.run(f'$FSLDIR/bin/fslroi {dwi_merged_path_noext} {t2w_imgseries_dir}/fslroi_vol {i} 1',
+               shell=True, check=True, env=du.nogz_env)
+        sp.run(f'$FSLDIR/bin/slicer {t2w_imgseries_dir}/fslroi_vol -a {t2w_imgseries_dir}/t2w_vol{i}_sm.png',
+               shell=True, check=True)
+        os.remove(f'{t2w_imgseries_dir}/fslroi_vol.nii')
+
+        # scale using NN interp (no file size increase)
+        sp.run(f'convert {t2w_imgseries_dir}/t2w_vol{i}_sm.png -scale \'500%\' {t2w_imgseries_dir}/t2w_vol{i:04d}.png',
+               shell=True, check=True)
+        os.remove(f'{t2w_imgseries_dir}/t2w_vol{i}_sm.png')
+
+    # gif anim
+    sp.run(f'convert -delay 50 {t2w_imgseries_dir}/*.png -loop 0 {qcdir}/t2w_vols_anim.gif',
+           shell=True, check=True)
+    shutil.rmtree(t2w_imgseries_dir)
+
+
+    # Generate Colour FA image
+    # This _floats image is viewable in fsleyes by setting the image display mode to RGB or
+    # RGB lines, or using ITK-SNAP and setting the Display Mode to RGB.
+    colourfa_fn = f'{tensor_pp}_colourFA_floats.nii'
+    sp.run('$FSLDIR/bin/fslmaths'
+          f' {tensor_pp}_V1 -abs'
+          f' -mul {tensor_pp}_FA'
+          f' -mul {finemask_fn}'
+          f' {colourfa_fn}',
+           shell=True, check=True, env=du.nogz_env)
+
+
+    # Normalization check could go here
+    #  ... leave for after harmonization
+
+
+    # 10. Write out results to same dir as nii and clean up tmpd
+    print(f"dmri_preprocess: (10) Writing outputs to {out_dir} ...", flush=True)
+
+    # move bvals, rbvecs, reg-dir and qcdir
+    shutil.move(str(bvals_path), out_dir)   # str required because shutil.move doesn't handle paths! Still!
+    shutil.move(str(rbvecs_path), out_dir)
+    shutil.move(qcdir, out_dir)
+
+    if custom_reg:
+        shutil.move(emc_log_fn, out_dir)
+    else:
+        zip_to(out_dir, f'{eddy_dirn.name}')
+
+    # noise, residual, rish, colourFA, MSE, rough-FA images go in qcdir
+    ent_fn = f'{du.tmpd}/dwi_stdpp-entropy.nii'
+    os.rename(f'{du.tmpd}/entropy.nii', ent_fn)
+    mse_fn = f'{du.tmpd}/dwi_stdpp-dtw_b{bqc}_mse_xfsm.nii'
+    os.rename(f'{du.tmpd}/fine_bbgmasking-dtw_b{bqc}_mse_xfsm.nii', mse_fn)
+    rough_fa_fn = f'{du.tmpd}/dwi_roughpp-dtw_b{bqc}_roughmask_FA.nii'
+    os.rename(f'{du.tmpd}/fine_bbgmasking-dtw_b{bqc}_roughmask_FA.nii', rough_fa_fn)
+    for fn in [colourfa_fn, ent_fn, mse_fn, rough_fa_fn] \
+              + noise_resid_fns \
+              + glob(fr'{du.tmpd}/dwi_stdpp-rish_l*.nii*'):
+        move_gzip_file(fn, f'{out_dir}/qc')
+
+    # gzip/move niftis to out_dir
+    for fn in [t2w_mean_fn, dw_mean_fn, dwi_stddata_path, unified_mask_fn] \
+                 + glob(fr'{du.tmpd}/mean_dw_b*.nii*'):
+        move_gzip_file(fn, out_dir)
+
+    # tissue_seg output files to their own directory, and zip the whole thing
+    seg_dirn = 'tissue_seg'
+    for fn in glob(f'{du.tmpd}/tissue_seg-*.nii*'):
+        move_gzip_file(fn, f'{du.tmpd}/{seg_dirn}', out_fn=basename(fn).replace('tissue_seg-', ''))
+
+    zip_to(out_dir, f'{seg_dirn}')
+
+    # tensor files to their own directory, and zip the whole thing
+    for fn in glob(fr'{tensor_pp}_*.nii*'):
+        move_gzip_file(fn, f'{du.tmpd}/tensor')
+
+    if len(du.nzbvals_uniq) > 1:
+        for pp in ss_tensor_pps:
+            for fn in glob(f'{pp}_[!V]*.nii*'):
+                move_gzip_file(fn, f'{du.tmpd}/tensor')
+
+    zip_to(out_dir, 'tensor')
+
+    # move dwi_merged to its own directory to de-emphasize and zip that too
+    if 'dwi_merged' in nii_path:
+        for fn in glob(f'{out_dir}/dwi_merged.*'):
+            move_gzip_file(fn, f'{out_dir}/dwi_merged')   # this is just move
+
+        merge_log = f'{out_dir}/dmri_merge_log.txt'
+        if os.path.isfile(merge_log):
+            move_gzip_file(merge_log, f'{out_dir}/dwi_merged')
+
+        zip_to(out_dir, 'dwi_merged', src_dir=f'{out_dir}')
+
+    # remove tmpd symlink
+    if du.verbose or (db_dir is not None):
+        os.remove(f'{out_dir}/{basename(du.tmpd)}')
+
+    # Remove temp. Goodbye, and thanks for all the fish!
+    shutil.rmtree(du.tmpd)
+
+
+def reduce_noise_ringing(dwi_data, dwi_data_path, roughmask_fn, bimod_mask, db_dir):
+    """Reduce noise and Gibbs ringing in T2/DWI images using mrtrix tools; return corrected data.
+    """
+
+    # On testing dwidenoise (see testing/denoise_degibbs-test), it causes dramatically lower noise
+    #   in higher-order RISH maps for subjects with lower SNR (e.g. UBC_0063_01), but doesn't make
+    #   much difference in higher SNR subjects (e.g. MCU_0051_01).
+    # Therefore, well worth it to run. Notes:
+    # - for algorithm details, see Veraart et al., 2016 doi: 10.1016/j.neuroimage.2016.08.016
+    # - extent takes list of odd numbers (i.e. widths of window cuboid in voxels; default 5,5,5)
+    # - in particular, there should not be anatomical details in the (RMS) noise residual (which is
+    #   different than the noise map that is output)
+    # - in Veraart, they say choose N > M (where M=31 directions, extent=5,5,5 gives N=125), but
+    #   also say, "in case of spatially varying noise, it might be beneficial to select a sliding
+    #   window with N ≳ M"; so try 3,3,3 on my data also
+    # - in MCU_0051_01, I would say extent=3 has more structure in RMS residual if anything
+    # - same in UBC_0063_01 -- definitely more structure with 3,3,3; so use extent=5
+
+    # make sure dwidenoise extent is greater than number of directions
+    win_sz = 5                  # good for CAN-BIND-1 with M < 40
+    if (du.nii.shape[3] > 40) and (du.nii.shape[3] < 150):
+        # HCP data
+        win_sz = 9
+
+    print(" "*4 + f"reduce_noise_ringing: Using window size = {win_sz} for data with M = {du.nii.shape[3]}")
+
+    dwi_noisex_fn = f'{du.tmpd}/dwi_noisex.nii'
+    noise_map_fn = dwi_noisex_fn.replace('.nii', '_noisemap.nii')
+
+    if du.verbose:
+        vstr = '-info'
+    else:
+        vstr = '-quiet'
+
+    if db_dir is None:
+        sp.run(f'$MRTRIXDIR/bin/dwidenoise {vstr}'
+            f' -mask {roughmask_fn}'
+            f' -extent {win_sz},{win_sz},{win_sz}'
+            f' -noise {noise_map_fn}'
+            f' {dwi_data_path} {dwi_noisex_fn}',
+            shell=True, check=True, env=du.nogz_env)
+
+    else:
+        # to skip dwidenoise and mrdegibbs during debugging, copy from a successful run in /tmp
+        for fn in ['dwi_noisex.nii', 'dwi_noisex_noisemap.nii', 'dwi_ringx.nii']:
+            os.symlink(f'{db_dir}/{fn}', f'{du.tmpd}/{fn}')
+
+    # threshold output image
+    du.math_op_nii(dwi_noisex_fn, '-thr 0', shenv=du.nogz_env)
+
+    # Output RMS residual noise image for visual QC check
+    dwi_noisex = nib.load(dwi_noisex_fn).get_fdata()
+    noisex_rms_resid = np.sqrt(np.mean((dwi_data - dwi_noisex)**2, axis=3))
+
+    noisex_rms_resid_fn = f'{du.tmpd}/dwi_noisex-rms_residual.nii'
+    du.make_nii(noisex_rms_resid, new_aff=du.nii.affine).to_filename(noisex_rms_resid_fn)
+
+    # RMS residual as percent of signal (avoiding divide by 0)
+    dwi_tmean = np.mean(dwi_data, axis=3)
+    noisex_rms_perc_resid = 100*np.divide(noisex_rms_resid, dwi_tmean, \
+                                          out=np.zeros_like(noisex_rms_resid), \
+                                          where=(dwi_tmean!=0))
+
+    noisex_rms_perc_resid_fn = f'{du.tmpd}/dwi_noisex-rms_perc_residual.nii'
+    du.make_nii(noisex_rms_perc_resid, new_aff=du.nii.affine).to_filename(noisex_rms_perc_resid_fn)
+
+    # report rough SNR
+    sig = dwi_tmean[bimod_mask].mean()
+    nse = noisex_rms_resid[bimod_mask].mean()
+    print(" "*4 + f"reduce_noise_ringing: Rough total RMS-SNR from noise residual: {sig/nse:0.1f}...")
+
+    # clear dwi_data out of memory to prevent swapping
+    del dwi_data
+    gc.collect()
+
+
+    # On testing mrdegibbs, it causes some smoothing which I don't love, but does also seem to
+    #   decrease the gibbs ringing (particularly near the corpus callosum in the t2w images). The
+    #   RMS residuals seem to make a lot of sense, with minima on the CSF boundary and maxima next
+    #   the boundary.
+    # Notes:
+    # - -axes 0,1 refers to the x-y plane, which is appropriate for data consisting of a stack
+    #   of axial slices
+    # - order doesn't matter: 0,1 = 1,0
+    # - if it's accelerated, is that a problem? No (from mailing list)
+    # - data looks smoothed after; is that normal? Yes (from mailing list)
+    # - apply degibbs to all images, or only b=0? All (from mailing list)
+    dwi_ringx_fn = f'{du.tmpd}/dwi_ringx.nii'
+
+    if db_dir is None:
+        sp.run(f'$MRTRIXDIR/bin/mrdegibbs {vstr}'
+                ' -axes 0,1'
+            f' {dwi_noisex_fn} {dwi_ringx_fn}',
+            shell=True, check=True, env=du.nogz_env)
+
+    # threshold and re-mask output image
+    du.math_op_nii(dwi_ringx_fn, '-thr 0', shenv=du.nogz_env)
+    du.math_op_nii(dwi_ringx_fn, f'-mul {roughmask_fn}', shenv=du.nogz_env)
+
+    # RMS residual btw degibbs and noisex images
+    dwi_ringx = nib.load(dwi_ringx_fn).get_fdata()
+    ringx_rms_resid = np.sqrt(np.mean((dwi_noisex - dwi_ringx)**2, axis=3))
+
+    ringx_rms_resid_fn = f'{du.tmpd}/dwi_ringx-rms_residual.nii'
+    du.make_nii(ringx_rms_resid, new_aff=du.nii.affine).to_filename(ringx_rms_resid_fn)
+
+    # report rough gibbs ringing magnitude
+    rng = ringx_rms_resid[bimod_mask].mean()
+    print(" "*4 + f"reduce_noise_ringing: Rough total RMS-SNR from ringing residual: {sig/rng:0.1f}...")
+
+
+    return dwi_ringx, [noise_map_fn, noisex_rms_resid_fn, noisex_rms_perc_resid_fn, ringx_rms_resid_fn]
+
+
+def custom_dwi_reg(dwi_data, dwi_biascorr, roughmask, bvecs_path):
+    """This function registers all t2w and dw images together, using the steps below. In testing,
+    this registration looked really good, *vast* improvement over the registration from
+    eddy_correct! However, the new eddy looks just as good, and separates motion and distortion
+    correction, so it should probably be preferred.
+
+    a. split 4D data on disk
+    b. register within t2w to t2w nonreg-mean using 6 dof, normcorr
+    c. create proper t2w-mean image after registration
+    d. create dwi nonreg-mean image
+    e. register within dwis with 12 dof, normcorr (save the transforms)
+    f. create clean dw-mean image after registration
+    g. register clean dw-mean to clean t2w-mean with 6 dof, mutualinfo (save the transform)
+    h. combine individual dw volume affines with meanreg and apply once
+    i. merge registered dw and t2w images to create final dwi-emc data
+    j. rotate bvecs
+
+    Returns the registered data, nii filename of same, and filenmame of rotated bvecs.
+    """
+
+    print("Registering DWI data using custom strategy")
+
+    # a. Write individual volumes to disk
+    v_fns = []
+    bcv_fns = []
+    t2w_cnt = 0
+    dw_cnt = 0
+    for v in range(du.nii.shape[3]):
+        # create list of individual volume names: v_fns
+        if du.t2w_vols[v]:
+            v_fn = f'{du.tmpd}/t2w_v{t2w_cnt:04d}.nii'     # e.g. t2w_v0001.nii
+            t2w_cnt += 1
+        else:
+            v_fn = f'{du.tmpd}/dw_v{dw_cnt:04d}.nii'
+            dw_cnt += 1
+
+        v_fns.append(v_fn)
+
+        bcv_fn = v_fn.replace('_v', '_bcv')
+        bcv_fns.append(bcv_fn)
+
+        du.make_nii(dwi_data[..., v], new_aff=du.nii.affine).to_filename(v_fn)
+        du.make_nii(dwi_biascorr[..., v], new_aff=du.nii.affine).to_filename(bcv_fn)
+
+    v_fns = np.array(v_fns)
+    bcv_fns = np.array(bcv_fns)
+
+
+    # b. Register t2w-vols to t2w-roughbrain using 6 dof, normcorr
+    #      n.b. this is bias-corrected and masked, so call it roughbrain
+    t2w_roughbrain = np.mean(dwi_biascorr[..., du.t2w_vols], axis=3)
+
+    t2w_roughbrain_fn = f'{du.tmpd}/t2w_roughbrain.nii'
+    du.make_nii(t2w_roughbrain, new_aff=du.nii.affine).to_filename(t2w_roughbrain_fn)
+
+    for bcv_fn in bcv_fns[du.t2w_vols]:
+        print(f"Registering {basename(bcv_fn[:-4])} to t2w_roughbrain", end='\r')
+
+        v_aff_fn = bcv_fn.replace('_bcv', '_v').replace('.nii', '.affine')
+
+        sp.run('$FSLDIR/bin/flirt'
+              f' -in {bcv_fn} -ref {t2w_roughbrain_fn}'
+               ' -nosearch -cost normcorr -dof 6'
+               ' -interp spline -paddingsize 1'
+              f' -omat {v_aff_fn} -out {bcv_fn}',
+               shell=True, check=True, env=du.nogz_env)
+
+        # note the spline interpolation seems to have slightly better properties
+        #   than default sinc, but still introduces negatives
+        du.math_op_nii(bcv_fn, '-thr 0', env=du.nogz_env)
+
+
+        # Also apply reg to non bias-corrected volumes
+        v_fn = bcv_fn.replace('_bcv', '_v')
+        sp.run('$FSLDIR/bin/flirt'
+              f' -in {v_fn} -ref {t2w_roughbrain_fn}'
+              f' -applyxfm -init {v_aff_fn}'
+               ' -interp spline -paddingsize 1'
+              f' -out {v_fn}',
+               shell=True, check=True, env=du.nogz_env)
+
+        du.math_op_nii(v_fn, '-thr 0', env=du.nogz_env)
+
+    print("")
+
+
+    # c. Create clean t2w-mean image after registration
+    shp = list(du.nii.shape[:3]) + [du.t2w_vols.sum()]
+    t2w_regvols = np.zeros(shp)
+
+    for i, bcv_fn in enumerate(bcv_fns[du.t2w_vols]):
+        t2w_regvols[..., i] = nib.load(bcv_fn).get_fdata()
+
+    t2w_mean = t2w_regvols.mean(axis=3)*roughmask
+
+    t2w_mean_fn = f'{du.tmpd}/t2w_mean_forreg.nii'
+    du.make_nii(t2w_mean, new_aff=du.nii.affine).to_filename(t2w_mean_fn)
+
+
+    # d. Create dwi nonreg-mean image
+    #      n.b. this is bias-corrected and masked, so call it roughbrain
+    dw_roughbrain = np.mean(dwi_biascorr[..., du.dw_vols], axis=3)
+
+    dw_roughbrain_fn = f'{du.tmpd}/dw_roughbrain.nii'
+    du.make_nii(dw_roughbrain, new_aff=du.nii.affine).to_filename(dw_roughbrain_fn)
+
+
+    # e. Register dw-vols to dw-roughbrain using 12 dof, normcorr
+    for bcv_fn in bcv_fns[du.dw_vols]:
+        print(f"Registering {basename(bcv_fn[:-4])} to dw_roughbrain", end='\r')
+
+        bcv_dwreg_fn = bcv_fn.replace('.nii', '_dwreg.nii')
+        v_aff_fn = bcv_fn.replace('_bcv', '_v').replace('.nii', '.affine')
+
+        sp.run('$FSLDIR/bin/flirt'
+              f' -in {bcv_fn} -ref {dw_roughbrain_fn}'
+               ' -nosearch -cost normcorr -dof 12'
+               ' -interp spline -paddingsize 1'
+              f' -omat {v_aff_fn} -out {bcv_dwreg_fn}',
+               shell=True, check=True, env=du.nogz_env)
+
+        du.math_op_nii(bcv_dwreg_fn, '-thr 0', env=du.nogz_env)
+
+    print("")
+
+
+    # f. create clean dw-mean image after registration
+    shp = list(du.nii.shape[:3]) + [du.dw_vols.sum()]
+    dw_regvols = np.zeros(shp)
+
+    for i, bcv_fn in enumerate(bcv_fns[du.dw_vols]):
+        bcv_dwreg_fn = bcv_fn.replace('.nii', '_dwreg.nii')
+        dw_regvols[..., i] = nib.load(bcv_dwreg_fn).get_fdata()
+
+    dw_mean = dw_regvols.mean(axis=3)*roughmask
+
+    dw_mean_fn = f'{du.tmpd}/dw_mean_forreg.nii'
+    du.make_nii(dw_mean, new_aff=du.nii.affine).to_filename(dw_mean_fn)
+
+
+    # g. register clean dw-mean to clean t2w-mean with 6 dof, mutualinfo
+    print("Registering dw_mean to t2w_mean")
+    dw_mean_t2reg_fn = f'{du.tmpd}/dw_mean_t2reg.nii'
+    meanreg_affine_fn = f'{du.tmpd}/meanreg.affine'
+
+    sp.run('$FSLDIR/bin/flirt'
+          f' -in {dw_mean_fn} -ref {t2w_mean_fn}'
+           ' -nosearch -cost mutualinfo -dof 6'
+           ' -interp spline -paddingsize 1'
+          f' -omat {meanreg_affine_fn} -out {dw_mean_t2reg_fn}',
+           shell=True, check=True, env=du.nogz_env)
+
+    meanreg_affine = np.genfromtxt(meanreg_affine_fn)
+
+    du.math_op_nii(dw_mean_t2reg_fn, '-thr 0', env=du.nogz_env)
+
+    dw_mean_t2reg = nib.load(dw_mean_t2reg_fn).get_fdata()
+
+
+    # h. Combine individual dw volume affines with meanreg and apply once
+    for v_fn in v_fns[du.dw_vols]:
+        print(f"Applying combined affines to {basename(v_fn[:-4])}", end='\r')
+
+        v_aff_fn = v_fn.replace('.nii', '.affine')
+        v_t2w_aff_fn = v_fn.replace('.nii', '_to_t2w.affine')
+
+        # # convert_xfm -omat <outmat_AtoC> -concat <mat_BtoC> <mat_AtoB>
+        # sp.run('$FSLDIR/bin/convert_xfm'
+        #       f' -omat {v_t2w_aff_fn}'
+        #       f' -concat {meanreg_affine_fn}'
+        #       f' {v_aff_fn}',
+        #        shell=True, check=True, env=du.nogz_env)
+
+        # Do my own matrix multiplication instead of relying on convert_xfm (for fun and some
+        #   useless precision)
+        v_aff = np.genfromtxt(v_aff_fn)
+        v_t2w_aff = meanreg_affine @ v_aff     # matrix multiplication
+        np.savetxt(v_t2w_aff_fn, v_t2w_aff, fmt='%21.18f', delimiter='  ', newline='  \n')  # emulate fsl output format, more or less
+
+        # Apply combined xfm to volume image and threshold the zeros
+        sp.run('$FSLDIR/bin/flirt'
+              f' -in {v_fn} -ref {t2w_mean_fn}'
+              f' -applyxfm -init {v_t2w_aff_fn}'
+               ' -interp spline -paddingsize 1'
+              f' -out {v_fn}',
+               shell=True, check=True, env=du.nogz_env)
+
+        du.math_op_nii(v_fn, '-thr 0', env=du.nogz_env)
+
+    print("")
+
+
+    # i. merge registered dw and t2w images to create final dwi-emc data
+    dwi_emcdata = np.zeros(du.nii.shape)
+
+    for i, v_fn in enumerate(v_fns):
+        dwi_emcdata[..., i] = nib.load(v_fn).get_fdata()
+
+    dwi_emcdata_path = Path(f'{du.tmpd}/dwi_emc.nii')
+    du.make_nii(dwi_emcdata, new_aff=du.nii.affine).to_filename(str(dwi_emcdata_path))
+
+
+    # j. rotate bvecs to match registrations
+    rbvecs_path, emc_log_fn = rotate_bvecs(bvecs_path, v_fns)
+
+
+    # k. clean up some files to prevent confusion
+    for fn in [t2w_mean_fn, dw_mean_fn, t2w_roughbrain_fn]:
+        os.remove(fn)
+
+    return dwi_emcdata, dwi_emcdata_path, rbvecs_path, emc_log_fn
+
+
+def rotate_bvecs(bvecs_path, v_fns):
+    """Rotate bvecs to match custom registration. Not necessary with eddy, since it does this
+    automatically.
+    """
+
+    # Rotate bvecs according to registrations
+    print("Rotating bvecs to match registrations")
+
+    # Need to make an ecclog similar to the output of eddy_correct
+    # the fdt_rotate_bvecs script relies _heavily_ on the format of this file!
+    # the ecclog has 3 garbage lines before the affine of each volume, then the
+    # 4x4 affine matrix, and ends with a newline.
+    emc_log_fn = f'{du.tmpd}/dwi_emc_reglog.txt'
+    with open(emc_log_fn, 'w') as of:
+        for v_fn in v_fns:
+            if 't2w_v' in v_fn:
+                v_aff_fn = v_fn.replace('.nii', '.affine')
+            else:
+                v_aff_fn = v_fn.replace('.nii', '_to_t2w.affine')
+
+            v_aff = np.genfromtxt(v_aff_fn)
+
+            of.write(f"Registration of {basename(v_fn[:-4])} to t2w-mean\n\n")
+            of.write("Resulting affine:\n")
+            np.savetxt(of, v_aff, fmt='%21.18f', delimiter=' ', newline=' \n')
+            of.write("\n")
+
+
+    rbvecs_path = Path(f'{du.tmpd}/dwi_emc.bvec')
+
+    if du.verbose:
+        stdout = None
+    else:
+        stdout = sp.DEVNULL
+
+    sp.run('$FSLDIR/bin/fdt_rotate_bvecs'
+          f' {bvecs_path} {rbvecs_path} {emc_log_fn}',
+           shell=True, check=True, env=du.nogz_env, stdout=stdout)
+
+    return rbvecs_path, emc_log_fn
+
+
+def eddy_reg(dwi_biascorr_fn, roughmask_fn, bvals_path, bvecs_path, repol, db_dir):
+    """Perform within-subject registration with FSL's eddy tool; this is meant to reduce
+    motion and distortion due to eddy currents.
+    """
+
+    # Set up eddy param files
+    dwi_emcdata_path = Path(f'{du.tmpd}/dwi_eddycorr.nii')
+    eddy_dirn        = Path(f'{du.tmpd}/eddy_iofiles')
+    eddy_dirn.mkdir()
+
+    eddy_acqparams_path = eddy_dirn / 'eddy_acqparams.txt'
+    with open(eddy_acqparams_path, 'w') as of:
+        of.write("0 1 0 0.05\n")
+        # ^^^ N.B. this implies that the image is blip-up (smears anterior?); if it's squashed
+        #          posterior, should really be 0 -1 ...; testing both ways, the registration
+        #          looks the same, but there is small signal difference, up to ~ 1% in small areas
+
+    eddy_index_path = eddy_dirn / 'eddy_index.txt'
+    with open(eddy_index_path, 'w') as of:
+        n_vols = du.nii.shape[3]
+        of.write("1 "*(n_vols - 1) + "1\n")  # 1 per volume
+
+
+    # Prepare args, call eddy
+    eddy_args = []
+
+    if du.verbose:
+        eddy_args.append('-v')
+
+    if repol:
+        # tells eddy to replace outlier _slices_ with estimated data
+        # replaced 1–3 slices in the whole scan in a well-behaved volunteer
+        eddy_args.append('--repol')
+
+    # !!!
+    # eddy's slice-to-volume movement correction
+    # if sl2vol:
+        # this may help with banding effect in the human volunteer from UBC
+        # set --mporder to an integer value greater than 0, up to no. of excitations in a volume
+        #   choose a value btw N/4 and N/2, where N is no. of slices for us
+        # set --slspec to a file with the slice order acquisition
+        # N.B. slice-to-vol motion correction is computationally very expensive so it is only
+        # implemented for the CUDA version; FSL says maybe next version eddy_openmp will have it
+
+
+    # Check eddy binary name; eddy on MacOS, eddy_openmp on Linux
+    os_name = sp.run('uname -s', shell=True, check=True,
+                     capture_output=True).stdout.decode().strip()
+
+    if os_name == 'Darwin':
+        eddy_name = 'eddy'
+    elif os_name == 'Linux':
+        eddy_name = 'eddy_openmp'
+
+    # estimate and report time to run
+    t_est = 30*np.product(du.nii.shape)/32e6
+    t_done = datetime.now() + timedelta(minutes=t_est)
+    print(" "*4 + f"eddy_reg: calling {eddy_name} with options {eddy_args}")
+    print(" "*4 + f"            done in ~ {t_est:.0f} min ({t_done.strftime('%H:%M')})")
+
+    if db_dir is None:
+        sp.run(f'$FSLDIR/bin/{eddy_name} ' + ' '.join(eddy_args) +
+            f' --imain={dwi_biascorr_fn} --mask={roughmask_fn}'
+            f' --acqp={eddy_acqparams_path} --index={eddy_index_path}'
+            f' --bvals={bvals_path} --bvecs={bvecs_path}'
+            f' --out={dwi_emcdata_path.with_suffix("")}',
+            shell=True, check=True, env=du.nogz_env)
+
+        print(" "*4 + f"eddy_reg: eddy done at {datetime.now().strftime('%H:%M')}")
+
+        if repol:
+            # Remove .eddy_outlier_free_data.nii to save space
+            du.rm_nii(dwi_emcdata_path.parent / (dwi_emcdata_path.stem + '.eddy_outlier_free_data'))
+
+    else:
+        # skip eddy on debug runs to save time
+        for fn in glob(f'{db_dir}/eddy_iofiles/dwi_eddycorr.eddy*'):
+            shutil.copy(fn, eddy_dirn)
+
+        fn = 'dwi_eddycorr.nii'
+        os.symlink(f'{db_dir}/{fn}', f'{du.tmpd}/{fn}')
+
+    # Threshold negative undershoots of the spline interpolation, re-apply the mask,
+    # and read corrected data
+    du.math_op_nii(dwi_emcdata_path, f'-mul {roughmask_fn}', shenv=du.nogz_env)
+    du.math_op_nii(dwi_emcdata_path, '-thr 0', shenv=du.nogz_env)
+
+    dwi_emcdata = nib.load(str(dwi_emcdata_path)).get_fdata()
+
+    # Collect other eddy outputs
+    for fn in dwi_emcdata_path.parent.glob(dwi_emcdata_path.stem + r'.eddy*'):
+        shutil.move(str(fn), eddy_dirn)  # sigh ... pathlib is not even fully supported in shutil
+
+    # Copy bvals and rotated bvecs so the iofiles dir can be zipped
+    shutil.copy(bvals_path, dwi_emcdata_path.with_suffix('.bval'))
+    shutil.copy(eddy_dirn.joinpath(dwi_emcdata_path.stem + '.eddy_rotated_bvecs'),
+                dwi_emcdata_path.with_suffix('.bvec'))
+
+    return dwi_emcdata, dwi_emcdata_path, eddy_dirn
+
+
+def mask_check(img_fn, mask_fn, outpng_fn):
+    """Generate a png overlay of the mask edges on an image."""
+
+    # was using slices here, but it sometimes doesn't do a good job:
+    #   for small ROIs as mask_fn, the mask is almost impossible to see
+    #   because the edges are grayscale along with the image
+    #   this is because slices outputs a gif regardless of extension, I think
+    # sp.run(f'$FSLDIR/bin/slices {img_fn} {mask_fn}'
+    #        f' -o {outpng_fn}',
+    #        shell=True, check=True)
+    #
+    # # blow it up, the better to see it with; now using `-s 3. -n` in slices/slicer
+    # sp.run(f'convert {outpng_fn} -scale \'300%\' {outpng_fn}',
+    #        shell=True, check=True)
+
+    # # output into image grid 5 across
+    # sz = du.nii.shape
+    scale = 3.
+    # out_width = np.ceil(5*sz[0]*scale).astype(int)
+
+    # sp.run(f'$FSLDIR/bin/slicer {img_fn} {mask_fn}'
+    #        f' -s {scale} -n'
+    #        f' -S 3 {out_width} {outpng_fn}',
+    #        shell=True, check=True)
+
+
+    mctmpd = f'{du.tmpd}/mask_check_tmp'
+    os.mkdir(mctmpd)
+
+    # 12 axial slices with higher density near the middle
+    for slice_perc in [20, 32, 38, 43, 48, 53, 58, 63, 68, 73, 78, 88]:
+
+        outf = f'{mctmpd}/z{slice_perc}.png'
+
+        sp.run(f'$FSLDIR/bin/slicer {img_fn} {mask_fn}'
+               f' -s {scale} -n'
+               f' -z {slice_perc/100} {outf}',
+               shell=True, check=True)
+
+    # 6 saggittal slices
+    for slice_perc in [63, 55, 50, 46, 41, 33]:
+
+        outf = f'{mctmpd}/x{slice_perc}.png'
+
+        sp.run(f'$FSLDIR/bin/slicer {img_fn} {mask_fn}'
+               f' -s {scale} -n'
+               f' -x {slice_perc/100} {outf}',
+               shell=True, check=True)
+
+    # 6 coronal slices
+    for slice_perc in [66, 56, 51, 45, 40, 33]:
+
+        outf = f'{mctmpd}/y{slice_perc}.png'
+
+        sp.run(f'$FSLDIR/bin/slicer {img_fn} {mask_fn}'
+               f' -s {scale} -n'
+               f' -y {slice_perc/100} {outf}',
+               shell=True, check=True)
+
+    # glue them together
+    sp.run(f'montage {mctmpd}/z*.png {mctmpd}/x*.png {mctmpd}/y*.png -mode concatenate -tile 6x {outpng_fn}',
+           shell=True, check=True)
+
+    shutil.rmtree(mctmpd)
+
+
+def record_tissue_metrics(tensor_pp, tissue_masks, pve_imgs, finemask, subjid, qcdir):
+    """Record mean, STD or CSF/GM/WM FA and MD for later inspection. Also plot on standardized
+    axes.
+    """
+
+    wm_pve, gm_pve, csf_pve = pve_imgs
+    gp_mask, stn_mask, rdn_mask, other_mask = tissue_masks[3:]
+
+    pve_thresh = 0.75
+
+    wm_mask =   (wm_pve > pve_thresh) & finemask
+    gm_mask =   (gm_pve > pve_thresh) & finemask
+    csf_mask = (csf_pve > pve_thresh) & finemask
+
+    other_mask = finemask & ~wm_mask & ~gm_mask & ~csf_mask & ~gp_mask & ~stn_mask & ~rdn_mask
+
+    fa_img = nib.load(f'{tensor_pp}_FA.nii').get_fdata()  # masked by finemask already
+    md_img = nib.load(f'{tensor_pp}_MD.nii').get_fdata()
+
+    def get_famd(mask):
+        if np.any(mask):
+            fa_vals = fa_img[mask]   # 1D vector
+            md_vals = md_img[mask]
+
+            fa_tup = (fa_vals.mean(), fa_vals.std())
+            md_tup = (md_vals.mean(), md_vals.std())
+        else:
+            fa_vals = np.array([])
+            md_vals = np.array([])
+
+            fa_tup = (np.nan, np.nan)
+            md_tup = (np.nan, np.nan)
+
+        return fa_vals, md_vals, fa_tup, md_tup
+
+    wm_fa_vals, wm_md_vals, wm_fa, wm_md     = get_famd(wm_mask)
+    gm_fa_vals, gm_md_vals, gm_fa, gm_md     = get_famd(gm_mask)
+    csf_fa_vals, csf_md_vals, csf_fa, csf_md = get_famd(csf_mask)
+
+    gp_fa_vals, gp_md_vals, gp_fa, gp_md     = get_famd(gp_mask)
+    stn_fa_vals, stn_md_vals, stn_fa, stn_md = get_famd(stn_mask)
+    rdn_fa_vals, rdn_md_vals, rdn_fa, rdn_md = get_famd(rdn_mask)
+    oth_fa_vals, oth_md_vals, oth_fa, oth_md = get_famd(other_mask)
+
+
+    # write out as single line of CSV for later combo at the group level
+    with open(f'{qcdir}/tissue_mean_metrics.csv', 'w') as of:
+        of.write('subjid,'
+                 'wm_fa_mean,wm_fa_std,wm_md_mean,wm_md_std,'
+                 'gm_fa_mean,gm_fa_std,gm_md_mean,gm_md_std,'
+                 'csf_fa_mean,csf_fa_std,csf_md_mean,csf_md_std,'
+                 'gp_fa_mean,gp_fa_std,gp_md_mean,gp_md_std,'
+                 'stn_fa_mean,stn_fa_std,stn_md_mean,stn_md_std,'
+                 'rdn_fa_mean,rdn_fa_std,rdn_md_mean,rdn_md_std\n')
+        of.write(f'{subjid},'
+                 f'{wm_fa[0]},{wm_fa[1]},{wm_md[0]},{wm_md[1]},'
+                 f'{gm_fa[0]},{gm_fa[1]},{gm_md[0]},{gm_md[1]},'
+                 f'{csf_fa[0]},{csf_fa[1]},{csf_md[0]},{csf_md[1]},'
+                 f'{gp_fa[0]},{gp_fa[1]},{gp_md[0]},{gp_md[1]},'
+                 f'{stn_fa[0]},{stn_fa[1]},{stn_md[0]},{stn_md[1]},'
+                 f'{rdn_fa[0]},{rdn_fa[1]},{rdn_md[0]},{rdn_md[1]}\n')
+
+
+    # plot should have 3 fairly distinct regions for the main tissues
+    fig, ax = plt.subplots(figsize=(4,4), dpi=200, constrained_layout=True)
+
+    x = np.concatenate((wm_md_vals, gm_md_vals, csf_md_vals, gp_md_vals, stn_md_vals, rdn_md_vals, oth_md_vals))
+    y = np.concatenate((wm_fa_vals, gm_fa_vals, csf_fa_vals, gp_fa_vals, stn_fa_vals, rdn_fa_vals, oth_fa_vals))
+
+    # label each tissue with a value that will correspond to a unique colour
+    labs = np.array([0.10]*len(wm_md_vals) + [0.20]*len(gm_md_vals) + [0.30]*len(csf_md_vals) \
+                    + [0.96]*len(gp_md_vals) + [0.97]*len(stn_md_vals) + [0.98]*len(rdn_md_vals) + [0.99]*len(oth_md_vals))
+    cmap = plt.cm.get_cmap('Set1')  # use colors 1–4, 7, and 9; see https://matplotlib.org/3.1.1/gallery/color/colormap_reference.html
+
+    # randomly permute the data so last plotted cluster doesn't obscure the earlier points
+    np.random.seed(42)
+    rr = np.random.rand(len(x))
+    sortkey = np.argsort(rr)
+
+    x = x[sortkey]
+    y = y[sortkey]
+    labs = labs[sortkey]
+
+    # scatter plot; plot every 5th point so it's not so dense
+    scatter = ax.scatter(x[::5], y[::5], c=labs[::5], s=5,
+                         cmap=cmap, vmin=0., vmax=1., alpha=0.2, zorder=1)
+
+
+    # Plot ellipses for cluster means and stds
+    #   Code from: https://stackoverflow.com/a/25022642/1329892
+    def draw_ellipse(xvar, yvar, fclr):
+        # widths come from eigenvalues, angle from eigenvectors
+        cov = np.cov(xvar, yvar)            # covariance matrix
+
+        vals, vecs = np.linalg.eigh(cov)    # eigenvals and vecs
+        order = vals.argsort()[::-1]        # descending order
+        vals = vals[order]
+        vecs = vecs[:,order]
+
+        theta = np.degrees(np.arctan2(*vecs[:,0][::-1]))
+        w, h = 2*np.sqrt(vals)              # ellipse dims are 2*SD
+
+        # fix colors to match scatter plot
+        fclr[3] = 0.5
+
+        ell = plt.matplotlib.patches.Ellipse(xy=(xvar.mean(), yvar.mean()),
+                                             width=w, height=h, angle=theta,
+                                             ec=(0.,0.,0.,0.5), fc=fclr,
+                                             zorder=2)
+
+        return ell
+
+    ax.add_artist(draw_ellipse(wm_md_vals, wm_fa_vals, list(cmap(0.10))))
+    ax.add_artist(draw_ellipse(gm_md_vals, gm_fa_vals, list(cmap(0.20))))
+    ax.add_artist(draw_ellipse(csf_md_vals, csf_fa_vals, list(cmap(0.30))))
+
+
+    # symbols for GP, STN, RedN
+    def mrkr_with_lab(ax, x, y, lab):
+        ax.plot(x, y, 'ko', ms=3, alpha=0.6, fillstyle='none')
+        ax.text(x + 0.06, y, lab, va='center', fontsize=6, alpha=0.6)
+
+    if np.any(gp_mask):
+        mrkr_with_lab(ax, gp_md_vals.mean(), gp_fa_vals.mean(), 'GP')
+
+    if np.any(stn_mask):
+        mrkr_with_lab(ax, stn_md_vals.mean(), stn_fa_vals.mean(), 'STN')
+
+    if np.any(rdn_mask):
+        mrkr_with_lab(ax, rdn_md_vals.mean(), rdn_fa_vals.mean(), 'RedN')
+
+
+    # axis labels and limits
+    ax.set_xlabel(r'MD ($\mu$m$^2$/ms)')
+    ax.set_ylabel('FA')
+    ax.set_xlim([0, 3])
+    ax.set_ylim([0, 1])
+
+    # legend, taking advantage of automatic legend creation:
+    #   https://matplotlib.org/3.1.0/gallery/lines_bars_and_markers/scatter_with_legend.html#automatedlegendcreation
+    handles, labels = scatter.legend_elements(prop='colors')
+
+    labels = ['WM', 'GM', 'CSF', 'Mix']
+    lgnd = ax.legend(handles, labels)
+
+    for lh in lgnd.legendHandles:
+        lh.set_alpha(0.65)      # markers in legend, instead of 0.2 as in the plot
+
+
+    # final pass, write out as pdf; also save pickled fig for later editing
+    fig.canvas.draw()
+
+    fig.savefig(f'{qcdir}/tissue_mean_metrics_plot.pdf')
+    pickle.dump(fig, open(f'{qcdir}/tissue_mean_metrics_plot.fig.pickle', 'wb'))
+
+
+def record_motion_metrics(motpars_path, subjid, qcdir):
+    """Record motion parameters output from FSL's eddy;
+    """
+
+    # the motpars file from eddy has colums abs(rms) and rel(rms)
+    motpars = np.genfromtxt(motpars_path)
+    fwdisp = motpars[:, 1]
+
+    # define by median, mean, max, num_bigspikes
+    #  threshold of 0.5 visually determined from MCU_0051_01
+    num_bigspikes = np.sum(fwdisp > 0.5)
+    num_smspikes = np.sum(fwdisp > 0.2) - num_bigspikes
+
+    # record the 'directionality' of the motion; i.e. whether one general
+    #   direction is more affected by the motion; this information is  in the
+    #   .eddy_parameters file; docs: The first six columns correspond to subject movement
+    #   starting with three translations followed by three rotations
+    mot_arr = np.genfromtxt(motpars_path.with_suffix('.eddy_parameters'))[:, 0:6]
+    mot_means = mot_arr.mean(axis=0)
+    mot_means[3:6] = 180/np.pi*mot_means[3:6]
+
+    # report outliers
+    #   could also count lines in file .eddy_outlier_report
+    #   here we are drawing from the array of outlier slices
+    outl_arr = np.genfromtxt(motpars_path.with_suffix('.eddy_outlier_map'), skip_header=1)
+    n_outl = outl_arr.sum()
+
+    # write out as single line of CSV for later combo at the group level
+    with open(f'{qcdir}/motion_fwdisp_metrics.csv', 'w') as of:
+        of.write('subjid,fd_median,fd_mean,fd_max,'
+                 'n_Sspike,n_Lspike,n_outl,mot_means\n')
+        of.write(f'{subjid},{np.median(fwdisp):0.4f},{fwdisp.mean():0.4f},{fwdisp.max():0.4f},'
+                 f'{num_smspikes:.0f},{num_bigspikes:.0f},{n_outl:.0f},{np.array2string(mot_means, precision=2)}\n')
+
+
+def record_snr_metrics(pve_imgs, dwi_data, noise_map_fn, t2w_mean, dw_msmeans, subjid, qcdir):
+    """Record WM SNR in the QC directory using temporal strategy and MRTrix's noise-map."""
+
+    snr_outpath = Path(f'{qcdir}/WM_snr.txt')
+
+    # Conservative WM mask
+    wm_mask = (pve_imgs[0] > 0.9)
+    # wm_mask_fn = f'{du.tmpd}/calc_snr-wm_mask.nii'
+    # du.make_nii(wm_mask, new_aff=du.nii.affine).to_filename(wm_mask_fn)
+
+    with open(snr_outpath, 'w') as outf:
+        outf.write(f"Number of b=0 image volumes: {du.t2w_vols.sum()}\n")
+        outf.write(f"Number of WM voxels: {wm_mask.sum()}\n")
+        wm_perc = 100*wm_mask.sum()/np.product(wm_mask.shape)
+        outf.write(f"Percentage of WM voxels: {wm_perc:0.1f}\n\n")
+
+
+    # Signal
+    signal_b0 = t2w_mean[wm_mask].mean()      # was using median; I think mean is more standard
+
+    # Temporal SNR
+    if du.t2w_vols.sum() > 2:
+
+        # Calculate SNR from the temporal standard deviation in WM
+        t2w_std = np.std(dwi_data[..., du.t2w_vols], axis=3, ddof=1)
+
+        tnoise = t2w_std[wm_mask].mean()
+        tsnr_b0 = signal_b0/tnoise
+
+        # non-zero shells
+        tsnr_bnz = []
+        for img in dw_msmeans:
+            snr = img[wm_mask].mean()/tnoise
+            tsnr_bnz.append(snr)
+
+        # record estimates
+        with open(snr_outpath, 'a') as outf:
+            outf.write(f"Temporal noise and SNR estimates in WM\n\n")
+            outf.write(f"  temporal noise:    {tnoise:0.2f}\n")
+            outf.write(f"  temporal SNR b=0:  {tsnr_b0:0.2f}\n")
+
+            for b, snr in zip(du.nzbvals_uniq, tsnr_bnz):
+                outf.write(f"  temporal SNR b={b:4d}: {snr:0.2f}\n")
+
+            outf.write("\n")
+
+        # vvv N.B. tested whether combos that leave out the first image resulted in higher
+        #          SNR: in general, all later combos had higher SNR than earlier, which was
+        #          driven by lower noise; but the first T2w image didn't fare particularly worse
+        #          than e.g. volume 8; so there isn't a rationale for dropping the first vol
+        #
+        # import itertools
+        # idxs = np.nonzero(du.t2w_vols)[0]
+        # combos = list(itertools.combinations(idxs, 4))
+        # for c in combos:
+        #     tf = np.zeros(du.t2w_vols.shape).astype(bool)
+        #     tf[list(c)] = True
+        #
+        #     t2wm = np.mean(dwi_data[..., tf], axis=3)
+        #     sig = t2wm[wm_mask].mean()
+        #
+        #     t2ws = np.std(dwi_data[..., tf], axis=3, ddof=1)
+        #     nse = t2ws[wm_mask].mean()
+        #
+        #     print(f"{c}: sig: {sig:0.1f}; nse: {nse:0.1f}; snr: {sig/nse:0.1f}")
+        # ^^^
+
+    else:
+        tnoise = np.nan
+        tsnr_b0 = np.nan
+
+
+    # MRTrix way should work regardless of number of b=0 volumes; dwidenoise outputs a noisemap
+    # which can be used for the denominator of SNR. From their [mailing list][1]:
+    # ... you can get the noise level with the output option -noise
+    # You may then compute SNR as the ratio between the mean b=X volumes and the noise level. You
+    #   will notice that the resulting maps have clear anatomical contrast in them. You can then
+    #   report median values across WM, specific ROIs, or the full brain.
+    # [1]: https://community.mrtrix.org/t/snr-calculation-comparable-to-dipy/667/2
+
+    # In my test, noise was very similar across tissue types; the snr varied based on signal,
+    #   so where WM SNR was 32 for b=0, GM SNR was 47, and CSF SNR was 80. However, b=1000 SNR
+    #   was slightly lower in CSF than WM, while GM was slightly higher (WM=15, CSF=13, GM=18).
+
+    mrt_noise_map = nib.load(noise_map_fn).get_fdata()
+    mrtnoise = np.nanmean(mrt_noise_map[wm_mask])  # exclude NaNs here; in HCP data, some NaNs
+                                                   # are showing up in mrtnoise within the wm_mask;
+                                                   # the mask looks fine for the t2w data above
+
+    mrtsnr_b0 = signal_b0/mrtnoise
+
+    mrtsnr_bnz = []
+    for img in dw_msmeans:
+        snr = img[wm_mask].mean()/mrtnoise
+        mrtsnr_bnz.append(snr)
+
+    # Append to temporal-snr output file
+    with open(snr_outpath, 'a') as outf:
+        outf.write(f"MRTrix noise and SNR estimates in WM\n\n")
+        outf.write(f"  MRTrix noise:      {mrtnoise:0.2f}\n")
+        outf.write(f"  MRTrix SNR b=0:    {mrtsnr_b0:0.2f}\n")
+
+        for b, snr in zip(du.nzbvals_uniq, mrtsnr_bnz):
+            outf.write(f"  MRTrix SNR b={b:4d}: {snr:0.2f}\n")
+
+
+    # Write out a one-line csv for easier combination later
+    with open(f'{qcdir}/WM_snr_metrics.csv', 'w') as outf:
+        csv_hdrs = ['subjid', 'no_b0', 'wm_vox', 'p_wm', \
+                    't_wmnoise', 't_wmsnr0', \
+                    'mrt_wmnoise', 'mrt_wmsnr0']
+
+        csv_vals = [f'{subjid}', f'{du.t2w_vols.sum()}', f'{wm_mask.sum()}', f'{wm_perc:0.1f}', \
+                    f'{tnoise:0.2f}', f'{tsnr_b0:0.2f}', \
+                    f'{mrtnoise:0.2f}', f'{mrtsnr_b0:0.2f}']
+
+        if np.isfinite(tnoise):
+            # insert merged list if tnoise has been calculated per shell
+            csv_hdrs[6:6] = [f't_wmsnr{x/1000.:.0f}' for x in du.nzbvals_uniq]
+            csv_vals[6:6] = [f'{x:0.2f}' for x in tsnr_bnz]
+
+        csv_hdrs += [f'mrt_wmsnr{x/1000.:.0f}' for x in du.nzbvals_uniq]
+        csv_vals += [f'{x:0.2f}' for x in mrtsnr_bnz]
+
+        outf.write(','.join(csv_hdrs) + '\n')
+        outf.write(','.join(csv_vals) + '\n')
+
+
+    # vvv Camino mult way will work if there are multiple non-averaged b=0 images
+    #     this is exactly the same as above; didn't want the dependency on Camino
+    # if du.t2w_vols.sum() > 2:
+
+    #     # For Philips scans, identify b=0.001 etc as b=0 volumes for Camino
+    #     bvalz_path = str(bvals_path).replace('.bval', '.bvalz')
+
+    #     sp.run('sed'
+    #            ' -e \'s/0.0[0-9][0-9]/0/g\''
+    #           f' {bvals_path}'
+    #           f' > {bvalz_path}',
+    #            shell=True, check=True)
+
+    #     # Convert bvecs for camino
+    #     bvscheme_path = rbvecs_path.with_suffix('.scheme')
+    #     sp.run('$CAMINODIR/bin/fsl2scheme'
+    #           f' -bvecfile {rbvecs_path}'
+    #           f' -bvalfile {bvalz_path}'
+    #           f' > {bvscheme_path}',
+    #            shell=True, check=True, stderr=sp.DEVNULL)
+
+    #     # WM SNR and Noise
+    #     sp.run('$CAMINODIR/bin/estimatesnr'
+    #           f' -bgmask {wm_mask_fn}'
+    #           f' -schemefile {bvscheme_path}'
+    #           f' -inputfile {dwi_stddata_path}'
+    #           f' > {snr_outpath}',
+    #            shell=True, check=True)
+
+    #     # Pull out camino's estimates from the file
+    #     with open(snr_outpath, 'r') as f:
+    #         for line in f:
+    #             if 'SNR mult' in line:
+    #                 camino_snr0 = float(line.split()[2])
+    #             elif 'sigma mult' in line:
+    #                 camino_noise = float(line.split()[2])
+
+    #     # Collect the log file
+    #     shutil.move(str(Path.home()) + '/CaminoRuntimeLog0.log', f'{du.tmpd}/')
+
+    # else:
+    #     # Don't estimate using camino -- background mask method is not worth doing
+    #     camino_snr0 = np.nan
+    #     camino_noise = np.nan
+    # ^^^
+
+
+def move_gzip_file(in_fn, targ_dir, out_fn=None):
+    """Create target directory if necessary, move files to there, gzip if requested/needed.
+    """
+
+    # Convert pathlib paths to strings for .endswith and shutil.move
+    if not isinstance(in_fn, str):
+        in_fn = str(in_fn)
+
+    os.makedirs(targ_dir, exist_ok=True)
+
+    if out_fn is None:
+        out_fn = basename(in_fn)
+
+    out_path = f'{targ_dir}/{out_fn}'
+
+    if du.output_gzip and in_fn.endswith('.nii'):
+
+        out_path += '.gz'
+
+        # gzip the official python way:
+        with open(in_fn, 'rb') as f_in:
+            with gzip.open(out_path, 'wb') as f_out:
+                shutil.copyfileobj(f_in, f_out)
+
+        # Also copy permissions, mtime, etc and fulfill the function name
+        shutil.copystat(in_fn, out_path)
+        os.remove(in_fn)
+
+    else:
+        shutil.move(in_fn, out_path)
+
+
+def zip_to(tgt_dir, dirn, src_dir=None):
+    """Create zip archive from dirn into tgt_dir and remove zipped files"""
+
+    if src_dir is None:
+        src_dir = du.tmpd
+
+    shutil.make_archive(f'{tgt_dir}/{dirn}', 'zip',
+                        f'{src_dir}', f'{dirn}')
+    shutil.rmtree(f'{src_dir}/{dirn}')
+
+
+# Entry point
+if __name__ == '__main__':
+
+    # Parse args
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+
+    parser.add_argument('nii_path', help="4D Nifti file of raw DW and T2W volumes (e.g. MCU_0029_01/dmripp/dwi_merged.nii)")
+    parser.add_argument('--repol', action='store_true', help="Use eddy's slice outlier replacement (recommended; differeces are small in my testing)")
+    parser.add_argument('--custom_reg', action='store_true', help="Use custom registration scheme instead of eddy (no longer recommended).")
+    parser.add_argument('--subjid', help="Subject ID to write in output CSV files")
+    parser.add_argument('--hcp', action='store_true', help="HCP data (disables negative value checking)")
+    parser.add_argument('--db_dir', help="Dir containing processed outputs to speed up debugging runs")
+    parser.add_argument('--db_seg', action='store_true', help="Troubleshoot segmentation from an interactive shell")
+    parser.add_argument('-v', '--verbose', action='store_true', help="Increase info messages")
+
+    args = parser.parse_args()
+
+    du.verbose = args.verbose   # later funtions will get their own verbose flags
+
+    assert 'FSLDIR' in du.nogz_env, "FSLDIR not set in envirionment"
+
+    # Run
+    main(args.nii_path, args.subjid, args.custom_reg, args.repol, args.hcp, args.db_dir, args.db_seg)

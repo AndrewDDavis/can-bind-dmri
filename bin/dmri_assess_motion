@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+# coding: utf-8
+
+# This code was run in the motion section of DMRI ROI Analysis notes
+# Uses output from mcpars_calcd
+# Plots motion params and tests for group differences in CAN-BIND-1
+
+# It needs a bit of work yet to make it a script or module.
+
+# Note this post:
+#   - http://www.diffusion-imaging.com/2015/11/a-guide-to-quantifying-head-motion-in.html
+# suggests total/average motion as a metric to compare between groups
+# I think framewise disp. is probably better
+
+# To fully assess motion for a technical note, could:
+# - generate boxplot of mean abs RMS motion per subject as in *Theys2014* paper
+# - compare repeatibility of high/low motion subjects using WDT and LDT tensor fitting approaches
+
+import numpy as np
+import matplotlib.pyplot as plt
+from cycler import cycler
+import pandas as pd
+from scipy import stats
+
+import multiprocessing as mp
+cpu_n = mp.cpu_count()
+
+
+# Make a 4-panel violin-plot array of the means
+
+def vioplot(ax, vals, grdf):
+    plt_kwargs={'ls': 'None', 'marker': 'o', 'ms': 3.5, 'mfc': 'None',
+                'mec': (0.,0.,0.,0.33), 'mew': 1.25,
+                'zorder': 2, 'label': None}
+
+    # extract group values
+    ctrl_vals = vals[grdf['ctrl']]
+    resp_vals = vals[grdf['resp']]
+    nonr_vals = vals[grdf['nonr']]
+
+    # remove nans
+    ctrl_vals = ctrl_vals[np.isfinite(ctrl_vals)]
+    resp_vals = resp_vals[np.isfinite(resp_vals)]
+    nonr_vals = nonr_vals[np.isfinite(nonr_vals)]
+
+    # plot values
+    ax.plot(len(ctrl_vals)*[1.], ctrl_vals, **plt_kwargs)
+    ax.plot(len(resp_vals)*[2.], resp_vals, **plt_kwargs)
+    ax.plot(len(nonr_vals)*[3.], nonr_vals, **plt_kwargs)
+
+    # Violin plots to show distribution
+    #   for BW selection notes, see https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.gaussian_kde.set_bandwidth.html
+    ax.set_prop_cycle(cycler('color', ['k', 'k', 'k']))     # all black
+    kde_ctrl = stats.gaussian_kde(ctrl_vals)
+    vparts = ax.violinplot([ctrl_vals, resp_vals, nonr_vals],
+                           positions=[1, 2, 3], widths=0.67,
+                           showmeans=True, showmedians=False, showextrema=False,
+                           bw_method=0.6*kde_ctrl.factor)
+    for pc in vparts['bodies']:
+        pc.set_facecolor((0.,0.36,0.57,0.5))    # blue violin bodies
+        # pc.set_edgecolor('none')
+
+    # Plot estimates as hlines and SEs as errorbars
+    # plt_kwargs={'lw': 1.25, 'colors': '#000000', 'zorder': 5}
+    # ax.hlines(ctrl_vals, 0.625, 1.375, **plt_kwargs)
+    # ax.hlines(crn_ests[1], 1.625, 2.375, **plt_kwargs)
+    # ax.hlines(crn_ests[2], 2.625, 3.375, **plt_kwargs)
+
+    plt_kwargs={'elinewidth': 1.0, 'ecolor': '#000000', 'alpha': 0.67,
+                'capsize': 8, 'capthick': 1.25,
+                'zorder': 4}
+
+    ax.errorbar(1, ctrl_vals.mean(), yerr=ctrl_vals.std()/np.sqrt(len(ctrl_vals)),
+                fmt='none', **plt_kwargs)
+    ax.errorbar(2, resp_vals.mean(), yerr=resp_vals.std()/np.sqrt(len(resp_vals)),
+                fmt='none', **plt_kwargs)
+    ax.errorbar(3, nonr_vals.mean(), yerr=nonr_vals.std()/np.sqrt(len(nonr_vals)),
+                fmt='none', **plt_kwargs)
+
+    # Ticks and labels
+    labels = ["CTRL", "RESP", "NONR"]
+
+    ax.set_xticks([1,2,3])
+    ax.set_xticklabels(labels)
+    ax.set_xlim(0.5, 3.5)
+
+    # horizontal grid lines
+    ax.yaxis.grid(True, lw=0.75, ls=':', color='black', alpha=0.20)
+
+    return ctrl_vals, resp_vals, nonr_vals
+
+
+# Read values from sheet: d-mean,fd-mean,d-b0mean,fd-b0mean
+# cd group_results/
+csvf = 'Motion-all_fdst_mm.csv'
+mdf = pd.read_csv(csvf, index_col=False)
+mdf.set_index('subjID', inplace=True)
+
+# on erikson
+# roidata_objs = pd.read_pickle('group_results/roidata_objs_excl_outl.pkl.gz')
+# obj = roidata_objs['FA123']
+# bools = obj.subj_bools_data
+# grdf = pd.concat([bools['ctrl'], bools['resp'], bools['nonr']], axis=1)
+# grdf.rename({0: 'ctrl', 1: 'resp', 2: 'nonr'}, axis='columns', inplace=True)
+# grdf.to_csv('group_results/cohort_csvs/visit_groups-v123.csv')
+
+grdf = pd.read_csv('cohort_csvs/visit_groups-v123.csv', index_col=0)
+
+subjs_pick = [True if x in grdf.index else False for x in mdf.index]    # 808
+mdf_use = mdf.loc[subjs_pick]               # 669 x 6
+# grlabs = pd.DataFrame(index=grdf.index)
+
+assert np.all(mdf_use.index == grdf.index)
+
+# Make the plots
+print("Plotting motion values...")
+fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(nrows=2, ncols=2, sharex=True,
+                                             figsize=(6, 6), dpi=150)
+
+dm_c, dm_r, dm_nr = vioplot(ax1, mdf_use['d-mean'], grdf)
+fdm_c, fdm_r, fdm_nr = vioplot(ax2, mdf_use['fd-mean'], grdf)
+dbm_c, dbm_r, dbm_nr = vioplot(ax3, mdf_use['d-b0mean'], grdf)
+fdbm_c, fdbm_r, fdbm_nr = vioplot(ax4, mdf_use['fd-b0mean'], grdf)
+
+# Finish the combined plot
+ax1.set_ylabel(r'$d$ (mm)')
+ax2.set_ylabel(r'$fd$ (mm)')
+ax3.set_ylabel(r'$d$ $T_2$-w (mm)')
+ax4.set_ylabel(r'$fd$ $T_2$-w (mm)')
+
+fig.tight_layout()
+
+# fig.subplots_adjust(left=0.15, bottom=0.175, right=0.98, top=0.935, wspace=0.07)
+fig.canvas.draw()
+fig.savefig(csvf.replace('csv', 'pdf'), dpi=1000)
+# fig.show()
+
+
+# Test for group differences using ANOVA and permutation testing on the F-stats
+
+# Permutation testing as an alternative to asuming the distributions are F-distributed.
+def permtest(x, F_test, B=3000):
+    """Permutation testing -- define a null distrubution from the data itelf.
+    As in: https://www.uvm.edu/~dhowell/StatPages/Resampling/RandomOneway/RandomOneway.html
+    """
+
+    N = len(x)
+    ctrl_n = grdf['ctrl'].sum()
+    resp_n = grdf['resp'].sum()
+    nonr_n = grdf['nonr'].sum()
+
+    # Draw B resamples, where each resample is a random permutation of the original data
+    Farr = np.zeros(B)
+
+    # def calc_null_Fs(i):
+    for i in range(B):
+        # Note "with replacement" means the same item can be chosen more than once
+        # We're just changing the order, so we want no replacement
+        s = np.random.choice(x, size=N, replace=False)
+
+        # For each resample, assign the first n1 observations to the first condition, the next n2
+        # observations to the second condition, and so on.
+        b1 = ctrl_n
+        b2 = ctrl_n + resp_n
+        ctrl_s = s[0:b1]
+        resp_s = s[b1:b2]
+        nonr_s = s[b2:N]
+
+        # For each resample, calculate F from the data.
+        print(f"Calculating F for resample {i}...", end="\r")
+        F, _ = stats.f_oneway(ctrl_s, resp_s, nonr_s)
+        Farr[i] = F
+
+    print("")
+
+    # with mp.Pool(processes=4) as pool:
+    #     pool.map(calc_null_Fs, range(B))
+
+    # Plot the null F distribution
+    fig, ax = plt.subplots()
+    ax.hist(Farr, bins=25)
+    ax.set_xlabel('F')
+    ax.set_ylabel('freq')
+    ax.axvline(x=F_test, color='k')
+    fig.tight_layout()
+    fig.canvas.draw()
+    # fig.show()
+
+    # Calculate p
+    # p represents the probability of obtaining an F as large as we obtained with our experimental
+    # data if the null hypothesis were true. We have simulated the null distribution, so all we
+    # have to do is count.
+    p = np.sum(Farr >= F_test)/B
+
+    return p, fig
+
+
+# T-test for CTRL/MDD? Not used here
+# t, p = stats.ttest_ind(x1, x2)
+
+# ANOVA to test CTRL/RESP/NONR
+print("ANOVA tests...")
+Fdm, pdm = stats.f_oneway(dm_c, dm_r, dm_nr)        # Fdm = 0.969
+Ffdm, pfdm = stats.f_oneway(fdm_c, fdm_r, fdm_nr)   # Ffdm = 8.984
+
+Fdbm, pdbm = stats.f_oneway(dbm_c, dbm_r, dbm_nr)
+Ffdbm, pfdbm = stats.f_oneway(fdbm_c, fdbm_r, fdbm_nr)
+
+# Calculate degrees of freedom for k groups, n total values (f_oneway should really output this)
+k = 3
+df1 = k - 1
+n = len(dm_c) + len(dm_r) + len(dm_nr)
+df2 = n - k
+
+# Run permutation tests to compare
+print("Permutation tests...")
+
+pdm2, fig = permtest(mdf_use['d-mean'], Fdm, B=int(1e5))
+fig.savefig(csvf.replace('.csv', '_dm_null_Fdist.pdf'), dpi=1000)
+
+pfdm2, fig = permtest(mdf_use['fd-mean'], Ffdm, B=int(1e6))  # need more permutations for smaller p
+fig.savefig(csvf.replace('.csv', '_fdm_null_Fdist.pdf'), dpi=1000)
+
+# Report results
+print("")
+outfile = csvf.replace('.csv', '_anova_results.txt')
+with open(outfile, 'w') as outf:
+    outf.write("d values:\n")
+    outf.write(f"  F = {Fdm:.3f}\n")
+    outf.write(f"  from anova: p = {pdm:.3f}\n")
+    outf.write(f"  from permu: p = {pdm2:.3f}\n\n")
+
+    outf.write("fd values\n")
+    outf.write(f"  F = {Ffdm:.3f}\n")
+    outf.write(f"  from anova: p = {pfdm:.6f}\n")
+    outf.write(f"  from permu: p = {pfdm2:.6f}\n\n")
+
+    outf.write(f"Degrees of freedom: {df1:.0f}, {df2:.0f}\n")
+
+with open(outfile, 'r') as outf:
+    print(outf.read())   # adds an extra newline; use end="" if that's a problem
+
+# pdm 0.380 vs pdm2 0.394
+# pfdm 0.000141 vs pfdm2 0.000131
+

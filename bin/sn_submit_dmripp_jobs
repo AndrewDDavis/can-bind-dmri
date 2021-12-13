@@ -1,0 +1,109 @@
+#!/bin/bash
+
+# Run this on Graham to start dmri_preprocess jobs
+
+# Arg defaults and parsing
+dry_run=False
+vis_list=()
+
+while [[ $# -gt 0 ]]; do
+    if [[ "$1" == '-n' ]]; then
+        dry_run=True
+        shift
+    else
+        vis_list=($1)
+        shift
+    fi
+done
+
+
+# CB-DTI project
+cd ~/project/davisad/CAN-BIND_DTI
+export PWD
+
+# Ensure FSL is available
+if ! which fsl > /dev/null 2>&1; then
+    echo "FSL not found"
+    exit 2
+elif [[ "$FSLDIR" != /home/davisad/fsl ]]; then
+    echo "FSLDIR incorrect"
+    exit 2
+fi
+
+# Locate dmripp dirs to be run
+echo "Locating visits with dmripp dirs..."
+if [[ ${#vis_list[@]} -gt 0 ]]; then
+    files_arr=()
+    for v in "${vis_list[@]}"; do
+        files_arr+=($(find 'data/subprojects/' -wholename "*/$v/dmripp" -print))
+    done
+else
+    files_arr=($(find 'data/subprojects/' -wholename '*/*/dmripp' -print | sort))
+fi
+
+if [[ ${#files_arr[@]} -eq 0 ]]; then
+    echo "No files found"
+    exit 2
+else
+    echo "Found ${#files_arr[@]} files"
+    start_time=$(date '+%H:%M')
+fi
+
+# Add dmripp job to the Graham scheduler
+for f in "${files_arr[@]}"; do
+
+    # e.g. f -> data/subprojects/CAM_B/CAM_0006_01/dmripp
+    new_path="${f%/dmripp}"
+    new_vid=$(printf $f | cut -d '/' -f 4)
+
+    # check for run already started
+    if [[ -n "$(find "${f}" -maxdepth 1 -name 'dmripp-*.out' -print -quit)" ]]; then
+        echo "sbatch output file exists; skipping ${new_path}"
+        continue
+    elif [[ -e "${f}/mask-fine_brain.nii.gz" ]]; then
+        echo "mask-fine_brain file exists; skipping ${new_path}"
+        continue
+    fi
+
+
+    # make a copy of the generic job and edit it
+    workin_des_file=bin/sn_dmripp_indiv_job_working
+    /bin/cp -f bin/sn_dmripp_indiv_job $workin_des_file
+
+    sed --in-place "s:dummy_path:${new_path}:g" $workin_des_file
+    sed --in-place "s/dummy_vid/${new_vid}/" $workin_des_file
+
+
+    # UCA_A jobs need a *lot* more memory
+    # Check for 128 or 256 resolution, allocate more
+    res=$($FSLDIR/bin/fslval ${f}/dwi_merged dim1)
+    if [[ $res -eq 128 ]]; then
+        sed --in-place "s/mem_mb/2048/" $workin_des_file
+        sed --in-place "s/time_limit/01:20:00/" $workin_des_file
+    elif [[ $res -eq 256 ]]; then
+        sed --in-place "s/mem_mb/4096/" $workin_des_file
+        sed --in-place "s/time_limit/05:20:00/" $workin_des_file
+    else
+        sed --in-place "s/mem_mb/1024/" $workin_des_file
+        sed --in-place "s/time_limit/00:45:00/" $workin_des_file
+    fi
+
+
+    # schedule the job
+    if [[ $dry_run == True ]]; then
+        echo "Would submit job for ${new_path}"
+    else
+        echo "Submitting job for ${new_path}"
+        sbatch $workin_des_file
+
+        /bin/rm $workin_des_file
+
+        # don't overwhelm the scheduler
+        sleep 1
+    fi
+done
+
+echo "Done"
+echo "Monitor jobs with: squeue -u $USER -t all"
+echo "and/or: sacct --format='JobID,JobName%15,State,ExitCode,Timelimit,Elapsed,NCPUS,TotalCPU,ReqMem,MaxRSS' -S ${start_time}"
+

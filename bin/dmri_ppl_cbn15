@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+
+# v0.1 (May 2020) by Andrew Davis (addavis@gmail.com)
+
+# Preprocess dMRI scans on CAN-BIND-15 subjects
+# Also generates some QC measures
+#
+# Script takes 1 required argument
+#   Arg 1: directory or archive (zip/tgz/tar.gz) containing DICOM files
+#
+# Outputs preprocessed dMRI files and QC files in a subdirectory named
+#   after this script.
+#
+# Example usage:
+#   fbn_dmri_ppl exam_0042
+
+# Parse and check args
+[[ $# -eq 0 ]] && { echo "$(basename $0): expected 1 argument (dicom dir or archive)"; exit 2; }
+
+dcmd="${1%/}" && shift
+
+[[ -e "$dcmd" ]] || { echo "$(basename $0): dcmd not found: $dcmd"; exit 2; }
+
+# Check for archive
+arch=False
+if [[ ${dcmd:(-4)} == .zip ]]; then
+    arch=True
+    tmpd=$(mktemp -d)
+    unzip "$dcmd" -d "$tmpd"
+    dcmd="$tmpd"
+
+elif [[ ${dcmd:(-4)} == .tgz ]] || [[ ${dcmd:(-7)} == .tar.gz ]]; then
+    arch=True
+    tmpd=$(mktemp -d)
+    tar -xzf "$dcmd" -C "$tmpd"
+    dcmd="$tmpd"
+fi
+
+[[ -d "$dcmd" ]] || { echo "$(basename $0): dcmd not a directory: $dcmd"; exit 2; }
+
+# Definitions
+# d: dmri scripts expected to be within this dir
+#    presumably this script is there too
+export DMRIDIR="$(cd "$(dirname $0)"; pwd -P)"     # absolute path
+
+
+# Main Work
+# Create working dir in current dir
+s=$(basename $0)
+wdir=./${s}-pid${$}
+mkdir "$wdir"
+
+
+# Convert dcm to nii
+echo "pipeline: Calling dcm2niix"
+{ dcm2niix -b y -z y -f '%d' -o "$wdir" "$dcmd"; } > "$wdir"/dcm2niix_log.txt 2>&1 \
+  || { echo "pipeline: Problem with dcm2niix; check $wdir/dcm2niix_log.txt"; exit 2; }
+grep '^Found' "$wdir"/dcm2niix_log.txt
+grep '^Convert' "$wdir"/dcm2niix_log.txt
+
+[[ $arch == True ]] && /bin/rm -r "$tmpd"
+echo ""
+
+# dMRI related files should now be at $wdir/DTI*.nii.gz and .bval/bvec
+
+
+# Merge niis into a single volume, along with bval bvec files
+#   eventually, may have to look at what site the data is from and specify
+#   different -n and --sepb0 etc
+#   for now, this works for UBC
+"$DMRIDIR"/dmri_merge -n 1 --cbn15 "$wdir" \
+  || { echo "pipeline: Problem with dmri_merge; check $wdir/dmripp/dmri_merge_log.txt"; exit 2; }
+echo ""
+
+
+# Preprocess merged dmri
+"$DMRIDIR"/dmri_preprocess --repol "$wdir"/dmripp/dwi_merged \
+  || { echo "pipeline: Problem with dmri_preprocess"; exit 2; }
+echo ""
+
+
+# Rename wdir, avoiding overwrite
+outdir=${s/_ppl/}
+[[ -d "$outdir" ]] \
+  && { echo "pipeline: Directory exists: $outdir"; exit 2; } \
+  || { echo "pipeline: Outputs in $outdir"; /bin/mv "$wdir" "$outdir"; }
+

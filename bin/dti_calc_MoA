@@ -1,0 +1,102 @@
+#!/bin/bash
+
+# v0.2.2 (Aug 2019) by Andrew Davis (addavis@gmail.com)
+
+function print_doc {
+cat << EOF
+
+$(basename $0)
+------------
+
+Calculate mode of anisotropy according to the Ennis and Kindlmann, 2006 paper.
+
+Usage:
+
+$(basename $0) [upper-tensor file]
+
+EOF
+}
+
+
+# Robust options
+set -o nounset
+set -o errexit
+set -o pipefail
+shopt -s nullglob
+
+# Defaults
+tens_fn=wdt_tensor_upper.nii.gz
+
+# Parse args
+while [ $# -gt 0 ]; do
+    case $1 in
+        -h | --help ) print_doc; exit 0;;
+        * ) tens_fn=$1;;
+    esac
+    shift
+done
+
+
+# Create an isotropic tensor from MD and zeros
+fslsplit ${tens_fn} tmp_tens_vols_ -t
+
+3dcalc -a tmp_tens_vols_0000.nii.gz \
+       -b tmp_tens_vols_0003.nii.gz \
+       -c tmp_tens_vols_0005.nii.gz \
+       -expr '1/3*(a+b+c)' \
+       -prefix tmp_MD_vol.nii.gz
+
+fslmaths tmp_MD_vol -mul 0 tmp_zero_vol
+
+fslmerge -t ennis_Aiso_upper \
+         tmp_MD_vol \
+         tmp_zero_vol \
+         tmp_zero_vol \
+         tmp_MD_vol \
+         tmp_zero_vol \
+         tmp_MD_vol
+
+/bin/rm tmp_tens_vols* tmp_MD_vol.nii.gz tmp_zero_vol.nii.gz
+
+# Calculate the anisotropic (deviatoric) tensor, and its norm
+fslmaths ${tens_fn} \
+         -sub ennis_Aiso_upper \
+         ennis_Aaniso_upper
+
+fslsplit ennis_Aaniso_upper tmp_Aaniso_upp_ -t
+
+3dcalc -a tmp_Aaniso_upp_0000.nii.gz \
+       -b tmp_Aaniso_upp_0001.nii.gz \
+       -c tmp_Aaniso_upp_0002.nii.gz \
+       -d tmp_Aaniso_upp_0003.nii.gz \
+       -e tmp_Aaniso_upp_0004.nii.gz \
+       -f tmp_Aaniso_upp_0005.nii.gz \
+       -expr 'sqrt(a**2 + 2*b**2 + 2*c**2 + d**2 + 2*e**2 + f**2)' \
+       -prefix ennis_K2_norm_aniso_eq7.nii.gz
+
+/bin/rm tmp_Aaniso_upp_*
+
+# calc FA here if desired
+3dcalc -a ennis_K2_norm_aniso_eq7.nii.gz \
+       -b wdt_FrobNorm.nii.gz \
+       -expr 'sqrt(3/2)*a/b' \
+       -prefix ennis_FA_eq13.nii.gz
+
+# Calculate MoA from elements of the argument to the determinant
+fslmaths ennis_Aaniso_upper \
+         -div ennis_K2_norm_aniso_eq7 \
+         tmp_detfrac
+
+fslsplit tmp_detfrac tmp_detfrac_ -t
+
+3dcalc -a tmp_detfrac_0000.nii.gz \
+       -b tmp_detfrac_0001.nii.gz \
+       -c tmp_detfrac_0002.nii.gz \
+       -d tmp_detfrac_0003.nii.gz \
+       -e tmp_detfrac_0004.nii.gz \
+       -f tmp_detfrac_0005.nii.gz \
+       -expr '3*sqrt(6)*(a*(d*f - e*e) - b*(b*f - e*c) + c*(b*e - d*c))' \
+       -prefix ennis_K3_eq9.nii.gz
+
+/bin/rm tmp_detfrac*
+

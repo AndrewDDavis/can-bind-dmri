@@ -1,0 +1,12 @@
+#!/bin/bash
+#SBATCH --account=def-hallg
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=1536
+#SBATCH --time=00:12:00
+#SBATCH --job-name=dummy_vid
+#SBATCH --output=dmri_dmasks/jhuspace_job-%j.out
+
+module purge 2> /dev/null
+
+~/bin/dti_to_jhuspace_dmasks

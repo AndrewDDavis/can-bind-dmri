@@ -1,0 +1,445 @@
+#!/bin/bash
+
+# Run this on Graham to start bedpostx jobs for non-tensor modelling manuscript
+
+# v0.3 (Oct 2019) by Andrew Davis (addavis@gmail.com)
+
+# Robust options
+set -o nounset    # fail on unset variables
+set -o errexit    # fail on non-zero return values
+set -o pipefail   # fail if any piped command fails
+
+# Arg defaults and parsing
+burnin=1000
+model=2
+nfibres=2
+hcp=False
+suppl=False
+slab=False
+quadrants=False
+bval=None
+runs=8
+j1_idx=0
+run_2j=False
+dry_run=False
+started_ok=False
+hold_arg=""
+vis_list=()
+
+while [[ $# -gt 0 ]]
+do
+    case "$1" in
+       --burnin ) burnin=$2; shift;;     # specify burn-in count for bedpostx run (can use K for 000)
+        --model ) model=$2; shift;;      # specify model type (1/2/3)
+      --nfibres ) nfibres=$2; shift;;    # specify number of fibres to model
+          --hcp ) hcp=True;;             # apply to higher-res & multishell HCP data
+        --suppl ) suppl=True;;           # apply to data in CBN01-suppl dir
+         --slab ) slab=True;;            # input images are named with _slab suffix
+    --quadrants ) quadrants=Maybe;;      # input masks are named as _slab_1of4 etc
+         --bval ) bval=$2; shift;;       # input files are named with e.g. _b1000 suffix
+         --runs ) runs=$2; shift;;       # number of runs to start (A,B,C,...)
+     --job1_idx ) j1_idx=$2; shift;;     # index of first job to start: 0 <= j1_idx <= 7; default 0
+        --run2j ) run_2j=True;;          # run 2 jobs if non-optimal processing scheme would result from 1
+             -n ) dry_run=True;;         # do not execute sbatch call; for testing
+         --s_ok ) started_ok=True;;      # disable check of ntmod-*.out files
+    -H | --hold ) hold_arg="--hold";;    # submit jobs in a held state; use 'scontrol release <jobid>' to start
+    -h | --help ) head -n 33 "$0"; exit 0;;
+              * ) vis_list+=(${1%/});;        # run on this specific visit(s)
+    esac
+    shift
+done
+
+# Require burnin and model
+[[ -n "$burnin" ]] || { echo "Error: empty burnin"; exit 1; }
+[[ -n "$model" ]] || { echo "Error: empty model"; exit 1; }
+
+# Allow K for 000
+burnin=${burnin/K/000}
+
+
+# CB-DTI project
+cd ~/project/davisad/CBN01-dMRI
+export PWD
+
+# Ensure FSL is available
+if ! which fsl > /dev/null 2>&1
+then
+    echo "FSL not found"
+    exit 2
+
+elif [[ "$FSLDIR" != /home/davisad/software/fsl ]]
+then
+    echo "FSLDIR incorrect"
+    exit 2
+fi
+
+# fsl_sub should be a symlink to the modified copy
+if [[ ! -e "$FSLDIR/bin/fsl_sub" || ! -L "$FSLDIR/bin/fsl_sub" ]]
+then
+  echo "Expected fsl_sub to be a (valid) symlink."
+  exit 2
+fi
+
+
+# Allocate resources (CPUs & Time) based on burn-in and allocated CPUs
+echo "Examining CPU and time requirements for job(s)..."
+# - allocate more cpus for more burn-in
+# - the scheduler doesn't seem to like allocating 8 cpus for more
+#   than 12 hours, but it will start 32 cpu jobs overnight, so
+#   request 32 cpus for higher resource jobs
+# - selected model also affects time
+# - and time increases with higher-res data and more directions
+# - specify time in seconds for ease of calculation
+study_dir=data/nontensor_models_analysis
+
+if [[ $hcp == True ]]
+then
+    study_dir+=/HCP
+    max_cpus=16     # 16 slice slab
+
+    if [[ $bval == None ]]
+    then
+        study_f=3.1
+
+    else
+        study_f=1.55
+    fi
+
+elif [[ $suppl == True ]]
+then
+    study_dir+=/CBN01-suppl
+    max_cpus=8      # 8 slice slab
+    study_f=0.5
+
+else
+    study_dir+=/CBN01
+    max_cpus=32     # total slices in CBN01 data ~= 54
+    study_f=1
+fi
+
+if [[ $burnin -lt 11000 ]]
+then
+    cpu_cnt=8
+
+else
+    cpu_cnt=$max_cpus
+fi
+
+if [[ $model == 1 ]]
+then
+    model_f=0.65
+
+elif [[ $model == 3 ]]
+then
+    model_f=0.90
+
+else
+    model_f=1.0
+fi
+
+function calc_tlimit {
+    # recall bash variable scope is such that variables are global by default, so we don't need to return anything
+    tlim_secs=$(python -c "print('{:.0f}'.format(${model_f}*${study_f}*36000/${cpu_cnt}*(${burnin}+1250)/(1000+1250)))")
+}
+
+calc_tlimit
+
+# The 128x128 images timed out for a bi=0 run; give a little more time
+[[ $burnin -eq 0 ]] && ((tlim_secs+=900))
+
+# Having a long time limit is undesirable: jobs above 24 hrs take much longer to get scheduled
+# - the schedule partitions on Graham are < 3 hrs, < 12 hrs, < 24 hrs, < 72 hrs, ...
+# - if the time limit is just over 12 hrs or 24 hrs, reduce the buffer a bit
+
+if [[ $tlim_secs -gt 43200 && $tlim_secs -le 45360 ]]
+then
+    echo "  tlim would be $tlim_secs sec with $cpu_cnt cpus"
+    echo "  reducing buffer slightly to get below 12 hrs"
+    tlim_secs=43199
+
+elif [[ $tlim_secs -gt 45360 && $cpu_cnt -lt $max_cpus ]]
+then
+    echo "  tlim would be $tlim_secs sec with $cpu_cnt cpus"
+    echo "  allocating more cpus to get the time down"
+    cpu_cnt=$max_cpus
+    calc_tlimit
+fi
+
+if [[ $tlim_secs -gt 86400 && $tlim_secs -le 88560 ]]
+then
+    echo "  tlim would be $tlim_secs sec with $cpu_cnt cpus"
+    echo "  reducing buffer slightly to get below 24 hrs"
+    tlim_secs=86399
+fi
+
+# Jobs with 16 cpus and long time limits may take a long time to get scheduled
+# Two possible strategies:
+# - double up the jobs and assign 32 cpus
+# - split the mask into quadrants (manually) and lower the time limit
+
+n_simult_jobs=1
+cpus_perbpx=$cpu_cnt
+
+if [[ $tlim_secs -gt 43200 && $cpu_cnt -eq 16 && $run_2j == True ]]
+then
+    echo "  tlim is more than 12 hrs with 16 cpus; will start 2 bpx jobs on 32 cpus"
+
+    # start 2 jobs on 32 cpus instead
+    n_simult_jobs=2
+    cpu_cnt=32
+    cpus_perbpx=16
+
+elif [[ $tlim_secs -gt 43200 && $quadrants == Maybe ]]
+then
+    echo "  tlim is more than 12 hrs; will run on quadrants masks"
+    quadrants=True
+
+    # use half the cpus and half the time for 1/4 the data
+    cpu_cnt=$((cpu_cnt/2))
+    cpus_perbpx=$cpu_cnt
+    tlim_secs=$((tlim_secs/2))
+fi
+
+
+# Report final calculated time limit
+echo "  tlim is $tlim_secs sec with $cpu_cnt cpus"
+
+# Locate dmripp dirs to be run
+echo "Locating visits with dmripp dirs..."
+if [[ ${#vis_list[@]} -gt 0 ]]
+then
+    dmripp_dirs=()
+    for v in "${vis_list[@]}"
+    do
+        dmripp_dirs+=($(find "$study_dir" -maxdepth 2 \
+                        -path "${study_dir}/${v}/dmripp" -print))
+    done
+
+else
+    dmripp_dirs=($(find "$study_dir" -maxdepth 2 \
+                   -path "${study_dir}/*/dmripp" -print | sort))
+fi
+
+if [[ ${#dmripp_dirs[@]} -eq 0 ]]
+then
+    echo "No dmripp dirs found"
+    exit 2
+else
+    echo "Found ${#dmripp_dirs[@]} dmripp dirs"
+    start_time=$(date '+%H:%M')
+fi
+
+function check_bpxdir_exists {
+    local s_chk=$1
+    local check_pf=Pass
+
+    if [[ -d "$workin_path/${bpxdir_qpref}-$s_chk" ]]
+    then
+        echo "ntmod: Warning: input dir exists in $workin_path: ${bpxdir_qpref}-$s_chk"
+        echo "                skipping $s_chk"
+        check_pf=Fail
+
+    elif [[ -d "$workin_path/${bpxdir_qpref}-$s_chk.bedpostX" ]]
+    then
+        echo "ntmod: Error: unfinished output dir exists in $workin_path: ${bpxdir_qpref}-$s_chk.bedpostX"
+        exit 2
+
+    elif [[ -d "$workin_path/${bpxdir_qpref}.bedpostX-$s_chk" ]]
+    then
+        echo "ntmod: Warning: output dir exists in $workin_path: ${bpxdir_qpref}.bedpostX-$s_chk"
+        echo "                skipping $s_chk"
+        check_pf=Fail
+
+    elif [[ -d "$workin_path/${bpxdir_qpref/bedpostx_input/ntmod}.bedpostX-$s_chk" ]] \
+      || [[ -d "$workin_path/ntmod_runs/${bpxdir_qpref/bedpostx_input/ntmod}.bedpostX-$s_chk" ]] \
+      || [[ -d "$workin_path/ntmod_qruns/${bpxdir_qpref/bedpostx_input/ntmod}.bedpostX-$s_chk" ]]
+    then
+        echo "ntmod: Warning: output dir exists in $workin_path: ${bpxdir_qpref/bedpostx_input/ntmod}.bedpostX-$s_chk"
+        echo "                skipping $s_chk"
+        check_pf=Fail
+    fi
+
+    echo $check_pf
+}
+
+
+# Iterate through the identified visit IDs
+# e.g. workin_path -> data/nontensor_models_analysis/HCP/MGH_1019/dmripp
+job_cnt=0
+for workin_path in "${dmripp_dirs[@]}"
+do
+    # Make a copy of the generic job and edit it
+    master_job_file=bin/sn_ntmod_indiv_job
+    workin_job_file=${master_job_file}_working
+    onerun_job_file=${master_job_file}_working_onerun
+
+    /bin/cp -f $master_job_file $workin_job_file
+
+    # path -> dmripp dir
+    sed --in-place "s:dummy_path:${workin_path}:g" $workin_job_file
+
+    # Vary the model type and burn-in amount to generate requisite stats
+    sed --in-place "s/burnin=1000/burnin=${burnin}/" $workin_job_file
+    sed --in-place "s/model=2/model=${model}/" $workin_job_file
+    sed --in-place "s/nfibres=2/nfibres=${nfibres}/" $workin_job_file
+
+    # Memory requirements are modest:
+    # - ~ 70 MiB reserved per process (slice) for a 140x140 image
+    # - reserving at least 1 GiB should be very safe everywhere
+    # - mem_amt is specified as mem per cpu (required when ntasks > 1)
+    [[ $cpu_cnt -ge 8 ]] \
+      && mem_amt=128M    \
+      || mem_amt=$((1024/cpu_cnt))M
+
+    sed --in-place "s/mem_amt/${mem_amt}/" $workin_job_file
+
+    # CPU requirements: 8 cpus means a task with burn-in=1000 takes ~ 1 h in CBN01 data
+    sed --in-place "s/cpu_cnt/${cpu_cnt}/" $workin_job_file
+    sed --in-place "s/cpus_perbpx/${cpus_perbpx}/" $workin_job_file
+
+    # Running time varies depending on burn-in and cpus allocated:
+    # ~ 8 h of total CPU time for 1000 burn-in with model=2
+    sed --in-place "s/time_limit/0-0:0:${tlim_secs}/" $workin_job_file
+
+    # Take into account b-shell, slab, and quadrant specific filenames (HCP data)
+    bpxdir_bn=bedpostx_input
+    mask_bn=mask-fine_bbg
+    data_bn=dwi_stdpp
+
+    if [[ $slab == True ]]
+    then
+        mask_bn+="_slab"
+        data_bn+="_slab"
+    fi
+
+    if [[ $bval != None ]]
+    then
+        bpxdir_bn+="_b${bval}"
+        data_bn+="_b${bval}"
+
+        sed --in-place "s:dwi_stdpp.bval:dwi_stdpp_b${bval}.bval:" $workin_job_file
+        sed --in-place "s:dwi_stdpp.bvec:dwi_stdpp_b${bval}.bvec:" $workin_job_file
+    fi
+
+    if [[ $quadrants == True ]]
+    then
+        bpxdir_bn+="_Xof4"
+        mask_bn+="_Xof4"
+    fi
+
+    sed --in-place "s:bpxdir_bn=bedpostx_input:bpxdir_bn=${bpxdir_bn}:" $workin_job_file
+    sed --in-place "s:mask-fine_bbg.nii:${mask_bn}.nii:"                $workin_job_file
+    sed --in-place "s:dwi_stdpp.nii:${data_bn}.nii:"                    $workin_job_file
+
+    # bpxdir prefix includes model parameters but not letter suffix
+    bpxdir_pref=${bpxdir_bn}_m${model}_n${nfibres}_bi${burnin}
+
+    # Check for runs already started/running/failed with same prefix
+    if [[ $started_ok != True ]] \
+      && [[ -n "$(find "$workin_path" -maxdepth 1 -name 'ntmod-*.out' -print -quit)" ]] \
+      && grep -G "${bpxdir_pref/_Xof4/_[1-4]of4}" $(find "$workin_path" -maxdepth 1 -name 'ntmod-*.out' -print) >/dev/null
+    then
+        # matching job already in progress
+        echo "ntmod: Warning: sbatch output file exists with matching model params; skipping ${bpxdir_pref} in ${workin_path}"
+        continue
+    fi
+
+    # Add ntmod jobs to the Graham/Beluga scheduler
+    # Start up to 8 runs of bedpostx with different random seeds
+    sfxs=(A B C D E F G H)              # used H_wpriors here when setting --Rmean and --Rstd
+
+    for ((i=${j1_idx}; i<$((j1_idx+runs)); i++))
+    do
+        # Check existence of input/output dirs
+        s=${sfxs[$i]}
+
+        # quadrants loop
+        [[ $quadrants == True ]] && qmax=4 || qmax=1
+        for ((q=1; q<=$qmax; q++))
+        do
+            # make a specific indiv_job copy for this run
+            /bin/cp -f $workin_job_file $onerun_job_file
+
+            if [[ $quadrants == True ]]
+            then
+                sed --in-place "s:_Xof4:_${q}of4:g" $onerun_job_file
+                bpxdir_qpref=${bpxdir_pref/_Xof4/_${q}of4}
+
+            else
+                bpxdir_qpref=$bpxdir_pref
+            fi
+
+            check_pf=$(check_bpxdir_exists $s)
+            [[ $check_pf == Fail ]] && continue
+
+            # define job index(s) to run and corresponding string
+            if [[ $n_simult_jobs -gt 1 ]]
+            then
+                j=$((i+1))
+                t=${sfxs[$j]}
+
+                check_pf=$(check_bpxdir_exists $t)
+                [[ $check_pf == Fail ]] && { echo "companion job failed check; giving up"; exit 2; }
+
+                jn_sfx=$s$t           # job name suffix
+                job_idxs="$i $j"
+
+            else
+                jn_sfx=$s
+                job_idxs="$i"
+            fi
+
+            [[ $quadrants == True ]] && jn_sfx+=q$q
+
+            # Specify index(s) to run in indiv_job file
+            [[ $i -gt 0 || $n_simult_jobs -gt 1 ]] \
+              && sed --in-place "s/^idxs=(0)/idxs=(${job_idxs})/" $onerun_job_file
+
+            # job name
+            visit_id=$(printf $workin_path | cut -d '/' -f 4)
+            job_name="$(echo -n $visit_id | tr -d _)_b${bval:0:1}_m${model}n${nfibres}bi${burnin%000}K-$jn_sfx"
+            sed --in-place "s/dummy_vid/${job_name}/" $onerun_job_file
+
+
+            # Finally, actually submit to sbatch! (Unless dry-run)
+            echo "Submitting jobs for ${workin_path} (${job_name})"
+
+            if [[ $dry_run == True ]]
+            then
+                echo "(Dry run) : sbatch $hold_arg $onerun_job_file"
+                exit 0
+            else
+                sbatch $hold_arg $onerun_job_file
+                job_cnt=$((job_cnt + n_simult_jobs))
+            fi
+
+            [[ $n_simult_jobs -gt 1 ]] && i=$j
+
+            sleep 1  # don't overwhelm the scheduler
+
+        done    # quadrants loop
+    done        # runs loop
+done            # dmripp_dirs loop
+
+# clean up job files
+[[ -n "${workin_job_file:-}" && -e "${workin_job_file}" ]] \
+  && /bin/rm $workin_job_file
+
+[[ -n "${onerun_job_file:-}" && -e "${onerun_job_file}" ]] \
+  && /bin/rm $onerun_job_file
+
+
+if [[ $job_cnt -gt 0 ]]
+then
+    echo "Done; Monitor $job_cnt started jobs with:"
+    echo "  squeue -u davisad"
+    echo "and"
+    echo "  sacct"
+
+else
+    echo "No jobs were started"
+fi
+echo ""
+
+# Can check for leftover output files representing failed runs:
+# find data/nontensor_models_analysis -name 'ntmod*.out'

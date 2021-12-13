@@ -7,7 +7,7 @@
 
    Made for the CAN-BIND project
 
-   v0.3.1 (Sept 2018) by Andrew Davis (addavis@gmail.com)
+   v0.3.2 (March 2019) by Andrew Davis (addavis@gmail.com)
 """
 
 from __future__ import print_function, division
@@ -16,12 +16,21 @@ from glob import glob
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.colors as mplclrs
 from cycler import cycler           # for manipulating matplotlib color cycles
 from scipy import stats
 from sklearn.linear_model import LinearRegression
 from nipype.algorithms import icc
 import statsmodels.api as sm
 import multiprocessing as mp
+
+__author__ = "Andrew Davis (addavis@gmail.com)"
+__version__ = '0.3.2'
+__license__ = "Distributed under The MIT License (MIT).  See http://opensource.org/licenses/MIT for details."
+
+# TODO:
+# - quadratic fit to site ROI-means data, rather than linear
+
 
 # import dev branch of pymer4 with REML option to fit()
 sys.path.insert(0, os.path.expanduser('~/Documents/Research_Projects/CAN-BIND_DTI/src/pymer4_dev'))
@@ -513,19 +522,25 @@ class RoiData:
             self.metric_label = metric
 
         # Parse visit code
-        gr_res_dir = RoiData.proj_dir + "group_results/"
+        gr_res_dir = RoiData.proj_dir + 'group_results/'
 
-        if visit_code == "1":
-            self.roidata_dir = gr_res_dir + "merged_skel_v01/"
+        if visit_code == '1':
+            self.roidata_dir = gr_res_dir + 'merged_skel_v01/'
 
-            chrt_csv = gr_res_dir + "cohort_csvs/cohort-v01.csv"
-            visit_list = gr_res_dir + "cohort_csvs/visit_list-v01.txt"
+            chrt_csv = gr_res_dir + 'cohort_csvs/cohort-v01.csv'
+            visit_list = gr_res_dir + 'cohort_csvs/visit_list-v01.txt'
 
-        elif visit_code == "123":
-            self.roidata_dir = gr_res_dir + "merged_skel_v01v02v03/"
+        elif visit_code == '2':
+            self.roidata_dir = gr_res_dir + 'merged_skel_v02/'
 
-            chrt_csv = gr_res_dir + "cohort_csvs/cohort-v01v02v03.csv"
-            visit_list = gr_res_dir + "cohort_csvs/visit_list-v01v02v03.txt"
+            chrt_csv = gr_res_dir + 'cohort_csvs/cohort-v02.csv'
+            visit_list = gr_res_dir + 'cohort_csvs/visit_list-v02.txt'
+
+        elif visit_code == '123':
+            self.roidata_dir = gr_res_dir + 'merged_skel_v01v02v03/'
+
+            chrt_csv = gr_res_dir + 'cohort_csvs/cohort-v01v02v03.csv'
+            visit_list = gr_res_dir + 'cohort_csvs/visit_list-v01v02v03.txt'
         else:
             raise ValueError("Unknown visit_code")
 
@@ -683,7 +698,7 @@ class RoiData:
             header_print("calc_icc")
             self.calc_icc(view=False)
 
-        # Stats
+        # Stats -- nothing for v02 at the moment
         if self.visit_code == '1':
             header_print("test_grpdiff_bsln")
             self.test_grpdiff_bsln()
@@ -1343,7 +1358,7 @@ class RoiData:
 
             orig_imp_cnt = np.sum(impute_visits_df.values)
 
-            if self.visit_code == "123":
+            if self.visit_code == '123':
                 # also impute other visits from same subject
                 for roi in impute_visits_df.columns:
                     impute_visits = impute_visits_df.index[impute_visits_df[roi]].tolist()
@@ -1381,10 +1396,10 @@ class RoiData:
         # Check each subject for whether there are any values to impute
         for sid in self.chrt_df.index:
             # visits associated with the subject
-            if self.visit_code == "123":
+            if self.visit_code == '123':
                 visits_to_check = [sid + '_01', sid + '_02', sid + '_03']
             else:
-                visits_to_check = [sid + '_01']
+                visits_to_check = [sid + '_0{}'.format(self.visit_code)]
 
             # N.B. impute_visits_df has an index and columns matching the data df bool
             if np.any(impute_visits_df.loc[visits_to_check]):
@@ -1453,22 +1468,20 @@ class RoiData:
 
         # Set up a plot, get list of matplotlib plot colours
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=[6.5, 4.5], dpi=150)
-        ax1.set_xlabel("Age")
+        cc = ax1._get_lines.prop_cycler
+        ax1.set_xlabel("Age (centred)")
         ax1.set_ylabel(self.metric_label)
-        ax2.set_xlabel("Sex")
+        ax2.set_xlabel("Sex (centred)")
         ax2.set_ylabel(self.metric_label)
         # plt_clrs = plt.rcParams['axes.prop_cycle'].by_key()['color']
 
-        plot_dir = self.roidata_dir + "regr_model_sa_plots/"
-        if not os.path.isdir(plot_dir):
-            os.mkdir(plot_dir)
 
-
-        def subproj_regress(sp_label):
-            """Regress sex and age for particular subproject.
-
-            Return regression coefficients.
-            """
+        # Regress sex and age for each subproject, retaining regression coefficients
+        regrs_sa = []
+        Ns = []
+        r2s = []
+        for sp_label in RoiData.subprojs:
+            # print ("Regressing age and sex in {} ...".format(sp_label))
 
             # Select controls from relevant subproject
             subproj01_bool__chrt = RoiData.chrt01_df.Subproj == sp_label
@@ -1479,7 +1492,7 @@ class RoiData:
 
 
             # Ensure the same subject IDs are being indexed in the cohort and data
-            assert np.all(RoiData.chrt01_df.index.values[faction_bool] == skelmean01_ser.index.values[faction_bool]), "Index problem in subproj_regress."
+            assert np.all(RoiData.chrt01_df.index.values[faction_bool] == skelmean01_ser.index.values[faction_bool]), "Index problem in regr_model_sa."
 
 
             # Define vector data to regress
@@ -1514,26 +1527,41 @@ class RoiData:
 
 
             # Plot coeffs per subproj
+            # Use colours with alpha, symbols for project phase
+            if sp_label.endswith('A'):
+                rgba = list(mplclrs.to_rgba(cc.next()['color']))
+                rgba[3] = 0.67
+                smbl = 'o'
+                if sp_label == 'CTT_A':
+                    ctt_clr = rgba
+            elif (sp_label == 'CAM_B') or (sp_label == 'UBC_G'):
+                rgba = list(mplclrs.to_rgba(cc.next()['color']))
+                rgba[3] = 0.67
+                smbl = '^'
+            elif sp_label == 'TGH_B':
+                rgba = ctt_clr
+                smbl = '^'
+            else:
+                smbl = '^'
+
+            # age plot
             sk = np.argsort(a)      # sortkey
-            ax1.plot(a[sk], y[sk], 'o')
+            ax1.plot(a[sk], y[sk], smbl,
+                     ms=4, mec=rgba, mfc='none', zorder=2, label=sp_label)
 
             yhat_age = regr.intercept_ + regr.coef_[0]*a + regr.coef_[1]*s.mean()
-            ax1.plot(a[sk], yhat_age[sk], 'k-')
+            ax1.plot(a[sk], yhat_age[sk], 'k-', zorder=1, alpha=0.33)
 
+            # sex plot
             sk = np.argsort(s)      # sortkey
-            ax2.plot(s[sk], y[sk], 'o')
+            ax2.plot(s[sk], y[sk], smbl,
+                     ms=4, mec=rgba, mfc='none', zorder=2, label=sp_label)
 
             yhat_sex = regr.intercept_ + regr.coef_[0]*a.mean() + regr.coef_[1]*s
-            ax2.plot(s[sk], yhat_sex[sk], 'k-')
+            ax2.plot(s[sk], yhat_sex[sk], 'k-', zorder=1, alpha=0.33)
 
-            return regr, N, r2
 
-        regrs_sa = []
-        Ns = []
-        r2s = []
-        for sp_label in RoiData.subprojs:
-            # print ("Regressing age and sex in {} ...".format(sp_label))
-            regr, N, r2 = subproj_regress(sp_label)
+            # Retain values for this subproject
             regrs_sa.append(regr)
             Ns.append(N)
             r2s.append(r2)
@@ -1548,7 +1576,7 @@ class RoiData:
         # Save and view the plots
         fig.tight_layout()
         fig.canvas.draw()
-        fig.savefig(plot_dir + "subprojs_regr_sa_" + self.metric + self.visit_code + ".png", dpi=600)
+        fig.savefig(self.roidata_dir + "subprojs_regr_sa_" + self.metric + self.visit_code + ".png", dpi=600)
 
         if view:
             fig.show()
@@ -1618,9 +1646,14 @@ class RoiData:
 
         assert (self.roi_saresid_df is not None), "Run remove_sa_effects() first."
 
-        # Use visit 01 saresid data, without Skel_mean value
+        # Use visit-01 saresid data if possible, excluding dropped ROIs
+        if (self.visit_code == '1') or (self.visit_code == '123'):
+            suff_str = '_01'
+        else:
+            suff_str = '_0{}'.format(self.visit_code)
+
         data = self.roi_saresid_df.copy()
-        data = data[data.index.str.endswith('_01')]
+        data = data[data.index.str.endswith(suff_str)]
         data = data.drop(columns=self.dropped_rois)     # Skel_mean and Fornix
 
         # Drop SSE outliers if possible
@@ -1640,7 +1673,7 @@ class RoiData:
 
             # Calculate mean ROI saresid values for ctrls in subproj
             subproj_ctrl_bool = self.subj_bools_data['ctrl'] & self.subproj_bools__data[i]
-            subproj_ctrl_bool = subproj_ctrl_bool[subproj_ctrl_bool.index.str.endswith('_01')]
+            subproj_ctrl_bool = subproj_ctrl_bool[subproj_ctrl_bool.index.str.endswith(suff_str)]
 
             subproj_means = data[subproj_ctrl_bool].mean()   # 42 elem dataseries
 
@@ -1655,7 +1688,7 @@ class RoiData:
 
         # Calculate global ctrl mean values, make it a column
         global_ctrl_bool = self.subj_bools_data['ctrl']
-        global_ctrl_bool = global_ctrl_bool[global_ctrl_bool.index.str.endswith('_01')]
+        global_ctrl_bool = global_ctrl_bool[global_ctrl_bool.index.str.endswith(suff_str)]
 
         ctrl_means = data[global_ctrl_bool].mean()  # 42 elem series
 
@@ -1664,12 +1697,9 @@ class RoiData:
 
         # Set up a plot
         fig, ax = plt.subplots(figsize=[6.5, 3], dpi=150)
+        cc = ax._get_lines.prop_cycler
         ax.set_xlabel("Global mean CTRL residual " + self.metric_label)
-        ax.set_ylabel("Subproj mean CTRL residual")
-
-        plot_dir = self.roidata_dir + "regr_model_site_plots/"
-        if not os.path.isdir(plot_dir):
-            os.mkdir(plot_dir)
+        ax.set_ylabel("Subproj mean value")
 
 
         # Calculate linear regressors of subproj means onto global means
@@ -1702,11 +1732,36 @@ class RoiData:
 
 
             # Plot regression results
-            sk = np.argsort(Ybar.ravel())      # sortkey
-            ax.plot(Ybar[sk], Yibar[sk], 'o')
+            sk = np.argsort(Ybar.ravel())      # sortkey for plotting
+
+            # Use colours with alpha, symbols for project phase
+            if sp_label.endswith('A'):
+                rgba = list(mplclrs.to_rgba(cc.next()['color']))
+                rgba[3] = 0.67
+                smbl = 'o'
+                ls = '-'
+                if sp_label == 'CTT_A':
+                    ctt_clr = rgba
+            elif sp_label == 'TGH_B':
+                rgba = ctt_clr
+                smbl = '^'
+                ls = '--'
+            elif (sp_label == 'CAM_B') or \
+                 ((sp_label == 'UBC_G') and (self.visit_code != '1')):
+                rgba = list(mplclrs.to_rgba(cc.next()['color']))
+                rgba[3] = 0.67
+                smbl = '^'
+                ls = '--'
+            else:
+                smbl = '^'
+                ls = '--'
+
+            ax.plot(Ybar[sk], Yibar[sk], smbl,
+                    ms=4, mec=rgba, mfc='none', zorder=2, label=sp_label)
 
             yhat = regr.intercept_ + regr.coef_[0]*Ybar
-            ax.plot(Ybar[sk], yhat[sk], 'k-', alpha=0.75)
+
+            ax.plot(Ybar[sk], yhat[sk], color=rgba[:3], ls=ls, zorder=1, alpha=0.33)
 
 
         # Add attributes
@@ -1716,9 +1771,13 @@ class RoiData:
 
 
         # Save and view the plots
+        # obj.subprojs = ['CTT_A', 'CAM_B', 'TGH_B', 'MCU_A', 'MCU_B', 'QNS_A', 'QNS_G', 'UBC_A', 'UBC_G', 'UCA_A', 'UCA_B']
+        site_labels = ['4A', '1A', '4B', '2A', '2B', '3A', '3B', '5A', '5B', '6A', '6B']
+        hndls, lbls = ax.get_legend_handles_labels()
+        ax.legend(handles=hndls, labels=site_labels, loc=2, ncol=3, fontsize='x-small')
         fig.tight_layout()
         fig.canvas.draw()
-        fig.savefig(plot_dir + "subprojs_regr_site_" + self.metric + self.visit_code + ".png", dpi=600)
+        fig.savefig(self.roidata_dir + "subprojs_regr_site_" + self.metric + self.visit_code + ".png", dpi=600)
 
         if view:
             fig.show()
@@ -1919,6 +1978,8 @@ class RoiData:
             ax1.set_ylabel(self.metric_label + " (baseline visit)")
         elif self.visit_code == '123':
             ax1.set_ylabel(self.metric_label)
+        else:
+            ax1.set_ylabel(self.metric_label + " (visit {})".format(self.visit_code))
 
         # Plot GS data on ax2
         # roi_gs_deltas_df = plt_roi_data(self.roi_gs_df, ax2)
@@ -1952,8 +2013,11 @@ class RoiData:
         fig.subplots_adjust(left=0.06, bottom=0.135, right=0.99, top=0.93, wspace=0.035, hspace=None)
 
         fig.canvas.draw()
-        fig.savefig(self.roidata_dir + "ROI_subproj_" + self.metric + "_raw+gs" + fn_suffix + ".png", dpi=1000)
-        with open(self.roidata_dir + "ROI_subproj_" + self.metric + "_sortkey" + fn_suffix + ".txt", 'w') as of:
+
+        plot_fn = self.roidata_dir + 'ROI_subproj_' + self.metric + '_raw+gs' + fn_suffix + '.png'
+        print("Saving plot to {}".format(plot_fn))
+        fig.savefig(plot_fn, dpi=1000)
+        with open(plot_fn.replace('raw+gs', '_sortkey').replace('.png', '.txt'), 'w') as of:
             of.write('\n'.join(rois_sorted))
 
         if view:

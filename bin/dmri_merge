@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+
+# Merge T2w/DWI data in NIfTI format (see print_usage below)
+# This used to be part of dti_preprocess; now called from dmri_preprocess or a dmri_ppl script
+# For CAN-BIND CBN01 and CBN15 data
+
+# v0.2.2 (Oct 2021) by Andrew Davis (addavis@gmail.com)
+#
+# Distributed under The MIT License (MIT).
+#   See http://opensource.org/licenses/MIT for details.
+
+
+# Robust scriptng options
+set -o nounset
+set -o errexit
+set -o pipefail
+shopt -s nullglob
+
+print_usage () {
+cat << EOF
+
+   $(basename $0)
+   --------------
+
+   This script scans the given directory for dMRI nifti scans named in the expected
+   way for CAN-BIND data. It combines all DWI/T2w niftis found into a single file, as well
+   as bval and bvec files. Also ensures floating point data type.
+
+   May be run before or from dmri_preprocess. The passed dirname should be an exam directory,
+   where each series is a NIfTI file (.nii or .nii.gz) with bval and bvec files as output
+   by dcm2nii (from the mricron package by Rorden). The script expects to find the
+   following files in the exam directory:
+     - NIfTI files named dti, or dti_a, dti_b, or DTI_..., or diff_..., etc.
+     - *.bval and *.bvec files named identically to the NIfTIs
+
+   Output files will go into a subdirectory of dirname, by default called 'dmripp'. If no
+   dirname is passed, the current directory will be used.
+
+   Usage: $(basename $0) [options] [-n <ndf>] [dirname]
+
+   Recommended arguments:
+      -n <ndf> : number of expected dMRI nii files per exam
+                    (eg. ndf=3 for dti_a, dti_b, and dti_c)
+       dirname : if not specified, current directory will be used
+
+   Options:
+       --sepb0 : data is split into dti_30dir and dti_b0 files (QNS and UBC)
+          --df : specify other no. of diffusion frames (e.g. 96)
+
+        --cbge : data is CAN-BIND GE type (37 frames in merged data)
+        --cbsp : data is CAN-BIND Siemens/Philips type (32 frames in merged data)
+        --cbsb : data is CAN-BIND Philips B type (37 frames in merged data)
+      --cbubcb : data is CAN-BIND UBC_B type (31 frames in merged data)
+       --cbn15 : data is CAN-BIND-15 type (60 diff frames, 9 b=0)
+        --walt : data is Walter\'s type (68 frames in merged data)
+        --fbnp : fBIRN phantom data DTI-NPAR or DTI-PAR
+
+     --txtbval : bval and bvec files have the form *_bvals.txt instead of *.bval (for HCP data)
+    --nochecks : disable checking of number of dwi volumes
+        --nods : do not downsample UCA images
+     --verbose : write many more messages to the log
+
+    Example, HCP data:
+      dmri_merge -n 2 --df 138 --txtbval
+
+EOF
+}
+
+# Defaults
+sep_b0=False
+diff_frames=68
+txt_bvals=False
+check_vols=True
+downsample_uca=True
+verb_flag=False
+prep_dir=dmripp
+logfile="${prep_dir}/dmri_merge_log.txt"
+
+# Parse arguments
+[[ $# == 0 ]] && { print_usage; exit 1; }
+
+while [ $# -gt 0 ]; do
+   case "$1" in
+            -n ) ndf="$2"; shift;;
+       --sepb0 ) sep_b0=True;;
+          --df ) diff_frames="$2"; shift;;
+
+        --cbge ) diff_frames=37;;               # 31 dirs + 6 b=0 in one file
+        --cbsp ) diff_frames=32; sep_b0=True;;  # 30 dirs + 1 b=0 in one file, 1 b=0 in another file
+        --cbsb ) diff_frames=36; sep_b0=True;;  # 30 dirs + 1 b=0 in one file, 5 b=0 in other files
+      --cbubcb ) diff_frames=31;;               # for UBC_B -- 30 dirs + 1 b=0 in one file only (ignore corrupt DTI_5T2_b0.nii.gz)
+       --cbn15 ) diff_frames=69;;               # for CAN-BIND-15 -- 30 b=1000, 30 b=2500, 9 b=0
+        --walt ) diff_frames=68;;               # 29 dirs + 5 b=0 in each file x two files
+        --fbnp ) diff_frames=29;;               # 12 b1000 + 12 b2500 + 5 b=0 for philips fBIRN
+
+     --txtbval ) txt_bvals=True;;
+    --nochecks ) check_vols=False;;
+        --nods ) downsample_uca=False;;
+     --verbose ) verb_flag=True;;
+     -h|--help ) print_usage; exit 0;;
+             * ) cd "$1";;                      # assumed to be directory name
+   esac
+   shift    # remove argument that has been handled
+done
+
+# Allow "unsafe mode" without specifying -n;
+#   try to guess the correct no. of files based on directory name
+#   this was part of the old dti_preprocess
+if [[ "$PWD" == *MCU* ]]; then
+    ndf=2
+    diff_frames=66
+elif [[ "$PWD" == *QNS_A* ]] || [[ "$PWD" == *UBC_A* ]]; then
+    sep_b0=True
+fi
+
+# Check arguments
+[[ -z ${ndf:-} ]] && { printf "dmri_merge Error: must specify expected number of dMRI files.\nUse '--help' for usage.\n"; exit 2; }
+
+
+# Output directory check -- message demoted to info since this is expected to fail for dmri_preprocess
+[[ -d ${prep_dir} ]] \
+  && { echo "dmri_merge: prep_dir exists in $(basename $PWD): ${prep_dir}.  Skipping..."; exit 0; }
+
+
+# Check for expected files
+if [[ $sep_b0 == True ]]; then
+    dwi_files=($(find . -maxdepth 1 \( -name 'dti_[0-9]*dir_[a-z].nii*' \
+                                    -o -name 'dti_[0-9]*dir.nii*' \
+                                    -o -name 'DTI_*[0-9]dirs_*[0-9]T2_b[0-9]*.nii*' \) | sort -t _ -k 4.2 -n)) # attempt to sort by b-value
+
+    dwi_b0_files=($(find . -maxdepth 1 \( -name 'dti_b0_[a-z].nii*' \
+                                       -o -name 'dti_b0.nii*' \
+                                       -o -name 'DTI_*[0-9]T2_b0_[A-Z].nii*' \) | sort))
+else
+    dwi_files=($(find . -maxdepth 1 \( -name 'dti_[a-z].nii*' \
+                                    -o -name 'dti.nii*' \
+                                    -o -name 'DTI_*[0-9]dirs_*[0-9]T2_b[0-9]*.nii*' \
+                                    -o -name 'DTI_[0-9]*dir_b[0-9]*b[0-9]*.nii*' \
+                                    -o -regex './DTI-N?PAR.nii.*' \
+                                    -o -name 'diff_[0-9]k.nii*' \) | sort -t _ -k 4.2 -n))
+fi
+
+dwi_files_noext=($(for df in "${dwi_files[@]}"; do $FSLDIR/bin/remove_ext "$df"; done))
+
+if [[ $txt_bvals == True ]]; then
+    bval_files=($(for df in "${dwi_files_noext[@]}"; do echo "${df}_bvals.txt"; done))
+    bvec_files=($(for df in "${dwi_files_noext[@]}"; do echo "${df}_bvecs_fsl.txt"; done))
+else
+    bval_files=($(for df in "${dwi_files_noext[@]}"; do echo "${df}.bval"; done))
+    bvec_files=($(for df in "${dwi_files_noext[@]}"; do echo "${df}.bvec"; done))
+fi
+
+for df in ${bval_files[@]}; do
+    [[ -e "${df}" ]] || { echo "ERROR (dmri_merge): ${df} not found."; exit 2; }
+done
+
+for df in ${bvec_files[@]}; do
+    [[ -e "${df}" ]] || { echo "ERROR (dmri_merge): ${df} not found."; exit 2; }
+done
+
+
+[[ ${#dwi_files[@]} == $ndf ]] \
+    || { echo "ERROR (dmri_merge): expected $ndf dti_* files, found ${#dwi_files[@]} in $(basename $PWD)."; exit 2; }
+[[ ${#bval_files[@]} == $ndf ]] \
+    || { echo "ERROR (dmri_merge): expected $ndf *.bval files, found ${#bval_files[@]} in $(basename $PWD)."; exit 2; }
+[[ ${#bvec_files[@]} == $ndf ]] \
+    || { echo "ERROR (dmri_merge): expected $ndf *.bvec files, found ${#bvec_files[@]} in $(basename $PWD)."; exit 2; }
+
+# FSL availability check. Some tools also require that FSLDIR be set in the environment
+if ! which fsl > /dev/null; then
+    echo "ERROR (dmri_merge): FSL not found on path."
+    exit 2
+elif [[ -z ${FSLDIR:-} ]]; then
+    echo "ERROR (dmri_merge): FSLDIR not set."
+    exit 2
+fi
+
+
+# Start the main work
+mkdir $prep_dir
+echo -n "dmri_merge: " > "${logfile}" && date >> "${logfile}"
+echo "dmri_merge: Merging $ndf dMRI nii(s)" | tee -a "${logfile}"
+# printf "            Redirecting output to ${logfile}\n\n"
+exec >> "${logfile}"
+exec 2>&1
+[[ $verb_flag == True ]] && set -x
+
+# Downsample artificial 256x256 image to 96x96 for UCA acquired images
+#   maybe better to try `-applyxfm -usesqform -out brain-MNI152`
+if [[ $(fslval "${dwi_files[0]}" dim1) -eq 256 ]] && [[ $downsample_uca == True ]]; then
+    for dwi_file in ${dwi_files[@]}; do
+        fpref=$("${FSLDIR}"/bin/remove_ext "$dwi_file")
+        # Usage: fslcreatehd <xsize> <ysize> <zsize> <tsize> <xvoxsize> <yvoxsize> <zvoxsize> <tr> <xorigin> <yorigin> <zorigin> <datatype> <headername>
+        p=($(fslval "$fpref" dim1)
+           $(fslval "$fpref" dim2)
+           $(fslval "$fpref" dim3)
+           $(fslval "$fpref" dim4)
+           $(fslval "$fpref" pixdim1)
+           $(fslval "$fpref" pixdim2)
+           $(fslval "$fpref" pixdim3)
+           $(fslval "$fpref" pixdim4)
+           $(fslval "$fpref" datatype))
+        fslcreatehd 96 96 ${p[2]} 1 2.5 2.5 2.5 ${p[7]} 0 0 0 ${p[8]} "$fpref"-96_ref
+
+        echo "dmri_merge: Downsampling $fpref (back) to 96x96..."
+        echo "WARNING (dmri_merge): this is known to cause problems!"
+        "${FSLDIR}"/bin/immv "$fpref" "$fpref"-orig_256
+        # flirt -in "$fpref"-orig_256 -out "$fpref" -ref "$fpref"-96_ref \
+        #       -applyxfm -init "$FSLDIR"/etc/flirtsch/ident.mat -interp sinc
+        flirt -in "$fpref"-orig_256 -out "$fpref" -ref "$fpref"-96_ref \
+              -applyxfm -usesqform -interp spline
+        "$FSLDIR"/bin/imrm "$fpref"-96_ref
+    done
+fi
+
+
+# Normalize images from differing b-value shells with differing TEs
+if [[ $ndf -gt 1 ]]; then
+
+    # Can check the TE from json, if it exists
+    bvf=${bval_files[0]}
+    jsf=${bvf%.bval}.json
+
+    if [[ -r $jsf ]]; then
+        te=$(grep EchoTime $jsf | cut -d : -f 2 | tr -d '[:space:],')
+
+        for bvf in ${bval_files[@]:1}; do
+            jsf=${bvf%.bval}.json
+            te2=$(grep EchoTime $jsf | cut -d : -f 2 | tr -d '[:space:],')
+
+            [[ $te == $te2 ]] \
+              || { echo "ERROR (dmri_merge): Volumes need normalization for differing TEs (not implemented)."; exit 2; }
+        done
+    else
+        echo "WARNING (dmri_merge): json file not found -- should manually confirm diff nii shells have same TE"
+    fi
+fi
+
+
+# Merge image volumes to 4D and bval/bvec files to match
+echo "dmri_merge: Merging dMRI niis..."
+if [[ $sep_b0 == True ]]; then
+    # merge images including b=0 files
+    fslmerge -t ${prep_dir}/dwi_merged "${dwi_files[@]}" "${dwi_b0_files[@]}"
+
+    # make bval and bvec files for series with only b=0
+    for f in ${dwi_b0_files[@]}; do
+        p=$("$FSLDIR"/bin/remove_ext "$f")
+
+        echo 0 > "${p}".bval
+        bval_files+=("${p}".bval)
+
+        printf "0\n0\n0\n" > "${p}".bvec
+        bvec_files+=("${p}".bvec)
+    done
+else
+    # merge images
+    fslmerge -t ${prep_dir}/dwi_merged "${dwi_files[@]}"
+fi
+
+# merge bval/bvec files
+#   now handle column type bval files (HCP) as well as row
+n_bval_rows=$(wc -l < ${bval_files[0]})
+n_nii_vols=$(fslval ${dwi_files_noext[0]} dim4 | tr -d ' ')
+
+if [[ $n_bval_rows -eq $n_nii_vols ]]; then
+    # column type
+    cat "${bval_files[@]}" > ${prep_dir}/dwi_merged.bval
+    cat "${bvec_files[@]}" > ${prep_dir}/dwi_merged.bvec
+
+elif [[ $n_bval_rows -eq 1 ]]; then
+    # row type
+    paste -d ' ' "${bval_files[@]}" > ${prep_dir}/dwi_merged.bval
+    paste -d ' ' "${bvec_files[@]}" > ${prep_dir}/dwi_merged.bvec
+
+else
+    echo "ERROR (dmri_merge): unknown bval file type"
+    exit 2
+fi
+
+# Ensure number of volumes match bval and bvecs
+if [[ $check_vols == True ]]; then
+    echo "dmri_merge: Checking..."
+    diff_bvecs=$((diff_frames*3))
+
+    [[ $(wc -w ${prep_dir}/dwi_merged.bval | sed 's/^[ \t]*\([0-9]\{1,\}\).*/\1/') == "$diff_frames" ]] \
+      || { echo "ERROR (dmri_merge): expected $diff_frames bvals in merged data set."; exit 2; }
+
+    [[ $(wc -w ${prep_dir}/dwi_merged.bvec | sed 's/^[ \t]*\([0-9]\{1,\}\).*/\1/') == "$diff_bvecs" ]] \
+      || { echo "ERROR (dmri_merge): expected $diff_bvecs bvecs in merged data set."; exit 2; }
+
+    printf "dmri_merge: Found $diff_frames DWI frames as expected.\n\n"
+fi
+
+printf "dmri_merge: Done.\n\n"

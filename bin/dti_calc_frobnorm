@@ -1,0 +1,92 @@
+#!/bin/bash
+
+# Calculate the Frobenius Norm from tensor values.
+# Run this from an exam directory containing a dmripp dir.
+
+# v0.4 (Jan 2021) by Andrew Davis (addavis@gmail.com)
+
+function print_doc {
+cat << EOF
+
+$(basename $0)
+-----------------
+
+Calculate Frobenius Norm from tensor values.
+
+By default looks in subdirectory dmripp for files like wdt_tensor_upper.
+
+Requires:
+- AFNI (https://afni.nimh.nih.gov/pub/dist/doc/htmldoc/background_install/install_instructs)
+
+Options:
+    --dt_pref <path>  : basename of input files (e.g. foo/bar/kdt)
+
+Outputs:
+    {dt_pref}_FrobNorm : nifti file with L2-norm values per voxel
+
+Example:
+    cd MCU_0051_01
+    dti_calc_frobnorm
+
+EOF
+}
+
+# Robustness
+set -o nounset
+set -o errexit
+set -o pipefail
+
+# Defaults
+dt_pref=dmripp/wdt
+
+# Parse args
+[[ $1 == -h ]] || [[ $1 == --help ]] && { print_doc; exit 0; }
+while [[ $# -gt 0 ]]; do
+    case $1 in
+      --dt_pref ) dt_pref="$2"; shift;;
+              * ) echo "Unrecognized option '$1'"; print_doc; exit 1;;
+    esac
+    shift
+done
+
+# Check for expected files
+if [[ $($FSLDIR/bin/imtest "${dt_pref}_tensor_upper") -eq 0 ]]; then
+    if [[ $($FSLDIR/bin/imtest "${dt_pref}_tensor") -eq 1 ]]; then
+        $FSLDIR/bin/immv "${dt_pref}_tensor" "${dt_pref}_tensor_upper"
+    else
+        echo "Error: ${dt_pref}_tensor_upper not found from ${PWD}."
+        exit 2
+    fi
+fi
+
+# Output non-gzip internally for speed
+old_FSLOUTPUTTYPE=$FSLOUTPUTTYPE
+export FSLOUTPUTTYPE=NIFTI
+
+# Calculation of the Frobenius Norm
+# Note FSL and Camino output the tensor as 6 time-ponits: Dxx,Dxy,Dxz,Dyy,Dyz,Dzz
+# i.e. upper part -- see https://en.wikipedia.org/wiki/Diffusion_MRI#Mathematical_foundation%E2%80%94tensors
+# I renamed the file to tensor_upper in dti_preprocess for clarity, and have duplicated that above.
+# To calculate the frobenius Norm of the full tensor, should double the off-diagonal elements (2nd, 3rd, and 5th)
+
+$FSLDIR/bin/fslsplit "${dt_pref}_tensor_upper.nii" "${dt_pref}_tensu_vol" -t
+
+$FSLDIR/bin/fslmaths "${dt_pref}_tensu_vol0000" -sqr        "${dt_pref}_tensu_vol0000"
+$FSLDIR/bin/fslmaths "${dt_pref}_tensu_vol0001" -sqr -mul 2 "${dt_pref}_tensu_vol0001"
+$FSLDIR/bin/fslmaths "${dt_pref}_tensu_vol0002" -sqr -mul 2 "${dt_pref}_tensu_vol0002"
+$FSLDIR/bin/fslmaths "${dt_pref}_tensu_vol0003" -sqr        "${dt_pref}_tensu_vol0003"
+$FSLDIR/bin/fslmaths "${dt_pref}_tensu_vol0004" -sqr -mul 2 "${dt_pref}_tensu_vol0004"
+$FSLDIR/bin/fslmaths "${dt_pref}_tensu_vol0005" -sqr        "${dt_pref}_tensu_vol0005"
+
+export FSLOUTPUTTYPE=$old_FSLOUTPUTTYPE
+
+$FSLDIR/bin/fslmaths "${dt_pref}_tensu_vol0000" \
+                -add "${dt_pref}_tensu_vol0001" \
+                -add "${dt_pref}_tensu_vol0002" \
+                -add "${dt_pref}_tensu_vol0003" \
+                -add "${dt_pref}_tensu_vol0004" \
+                -add "${dt_pref}_tensu_vol0005" \
+                -sqrt \
+                "${dt_pref}_FrobNorm"
+
+/bin/rm "${dt_pref}_tensu_vol"[0-9]*

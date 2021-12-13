@@ -1,0 +1,16 @@
+#!/bin/bash
+#SBATCH --account=def-hallg
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=2
+#SBATCH --mem-per-cpu=mem_mb
+#SBATCH --time=time_limit
+#SBATCH --job-name=dummy_vid
+#SBATCH --output=dummy_path/dmripp/dmripp-%j.out
+
+module purge 2> /dev/null
+module load python/3
+module load java
+source ~/cbdti-venv/bin/activate
+
+cd dummy_path
+$DMRIDIR/bin/dmri_preprocess .

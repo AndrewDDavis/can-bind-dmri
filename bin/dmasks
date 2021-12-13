@@ -1,0 +1,793 @@
+#!/usr/bin/env python3
+# coding: utf-8
+"""Reads a 4D nii image of raw T2-w and DW volumes. This can be created using dmri_merge_scans.
+
+- resamples to 2 mm isotropic resolution
+- smoothes with gaussian and anisotropic (perona-malik) diffusion
+- calculates masks using tensor MSE and entropy
+- returns to input resolution
+
+Expects to find FSL-style .bval and .bvec files next to the input nii. Outputs masks for
+registration after processing.
+
+This should be run after (or as part of) dmri_preprocess.
+
+ 0. read image data, bvals
+ 1. create processed images like entropy
+ 2. resample and smooth maps to be segmented: MSE, Entropy
+ 3. segment with KMeans, including background
+ 4. morphological operations
+ 5. resample back to input resolution
+ 6. write out results
+
+Examples:
+dmasks --rough dmripp/dwi_merged.nii.gz
+dmasks --fine pveseg.nii.gz dmripp/dwi_biascorr.nii.gz
+dmasks dmripp/dwi_emcorr.nii.gz
+"""
+
+__author__ = "Andrew Davis (addavis@gmail.com)"
+__version__ = "0.2 (Jan 2019)"
+__license__ = "Distributed under The MIT License (MIT).  See http://opensource.org/licenses/MIT for details."
+
+
+# TODO
+
+# - Define additional masks:
+#   + WM-mask from the FAST T2w PV estimate, + finemask from here, + FA > 0.15; see wm_seg code in dmri_utils
+#   + Linear-Anisotropy-Mask using MObyFA, as in nontensormodels/UCA: top 2% of values would be good
+#   + Planar-Anisotropy-Mask; bottom 2% of MObyFA values
+#   e.g. fslmaths wdt/wdt_MO.nii.gz -mul wdt/wdt_FA -mul wm_mask wdt_MO_by_FA_in_WM
+#        lowthresh=$(fslstats wdt_MO_by_FA_in_WM -P 2)
+#        highthresh=$(fslstats wdt_MO_by_FA_in_WM -P 98)
+#        fslmaths wdt_MO_by_FA_in_WM -thr $highthresh -bin mask-linear_anis
+#        fslmaths wdt_MO_by_FA_in_WM -uthr $lowthresh -abs -bin mask-planar_anis
+
+# - incorporate run_fast() from dmri_preprocess into dmri_utils, so that dmasks can run its own
+#   pve seg; maybe with the 'none' keyword as arg instead of providing a seg_fn to --fine
+
+# - consider whether to fill holes on the qtmask
+
+# - use fast pveseg output of t2w image with a "shell" to
+#   exclude background from parameter maps; maybe also use an absolute threshold,
+#   e.g. a percentage of GM signal on the T2w image, and the shell-mask, but be careful
+#   of globus pallidus signal; maybe just add this as a bet-quality check: make sure
+#   there is a healthy population of low-signal voxels on the margin
+
+# - list all outputs in the main documentation
+
+# - add -n; number of clusters command line option
+
+
+import os, shutil, gzip, tempfile
+from glob import glob
+import nibabel as nib
+import numpy as np
+import subprocess as sp
+import medpy.filter as mpf
+import warnings  # for ^^^
+import scipy.ndimage as ndi
+from scipy import stats
+from sklearn.cluster import KMeans
+import matplotlib.pyplot as plt
+
+import dmri_utils as du     # dmri_utils.py in same directory as script
+
+#   N.B. sys.path[0] is already this script's directory, so we don't need
+#        os.path.dirname(os.path.abspath(__file__))
+# src_path = os.path.join(os.path.dirname(sys.path[0]), 'src')
+# sys.path.insert(0, src_path)
+
+
+def main(out_dir, rough_mode, fine_mode, use_ent):
+    """Calculate masks..."""
+
+    if du.verbose:
+        print(f'dmasks: tmp working directory: {du.tmpd}')
+
+    # 0. Read 4D data array with time axis being DW volumes
+    dwi_data = du.nii.get_fdata()      # e.g. dwi_data.shape -> (96, 96, 52, 37)
+    dwi_data_fnp = du.get_nii_prefix(du.nii.get_filename())
+
+    assert dwi_data.dtype == np.float_, "Expected float data from nifti."
+    assert len(dwi_data.shape) <= 4, "Expected 4D data at the most."
+
+    # b-vals as vector
+    # with open(bvals_fn, 'r') as f:
+    #     line = f.read()
+    #     bvals = np.array(line.split(), dtype=np.int_)
+    bvals_fn = dwi_data_fnp + '.bval'
+    bvals = np.genfromtxt(bvals_fn)
+
+    assert bvals.ndim == 1, "b-values file should have values on 1 line; got:\n{}".format(bvals)
+    assert len(bvals) == dwi_data.shape[3], "Should have 1 b-value for every volume in nii; have {} and {}".format(len(bvals), dwi_data.shape[3])
+
+    t2w_vols = (bvals < 0.1)
+    dw_vols = ~t2w_vols
+
+
+    # Rough brain-mask with bet, and exclude 0 voxels
+    roughmask, roughmask_fn = du.rough_bbgmasking(dwi_data, t2w_vols, shenv=du.nogz_env)
+
+    # Mind output file path and write out to out_dir (maybe with gzip)
+    write_out_mask(roughmask, roughmask_fn, out_dir)
+
+
+    if rough_mode:
+
+        # In rough mode, we're done after outputting the rough brain-mask
+        # clean up and close
+        shutil.rmtree(du.tmpd)
+        return
+
+    if fine_mode:
+        # Better brain mask incorporating seg
+        # Finer mask; we can refine roughmask, since pveseg is available. After seeing
+        #   the quality of the pveseg background segmentation on MCU_0051_01, this
+        #   outperforms a thresholding method.
+        #
+        # Strategy:
+        # a. Trim the roughmask based on the bg_mask (seg_vol < 0.5) & (seg_vol > 3.5)
+        # b. Select largest connected component
+        # c. Fill holes
+        # d. Binary opening
+
+        seg_vol = du.check_load_nii(seg_fn).get_fdata().astype(np.int)
+        fg_mask = (seg_vol > 0.5) & (seg_vol < 3.5)
+        finemask = roughmask & fg_mask    # seg_vol probably has roughmask applied already
+
+
+        # b. Label image and find LCC with square connectivity; see mask_morphops for more detail
+        bg_labs, n_feat = ndi.label(finemask)    # e.g. 28 features, mostly isolated voxels
+
+        # most common label value is label of biggest component
+        lcc_lab = stats.mode(bg_labs[bg_labs > 0], axis=None).mode[0]
+        finemask = (bg_labs == lcc_lab)
+
+
+        # c. Fill holes with square connectivity
+        finemask = ndi.binary_fill_holes(finemask)
+
+
+        # d. Binary opening; using fslmaths
+        finemask_fn = f'{du.tmpd}/mask-fine_brain.nii'
+        du.make_nii(finemask, new_aff=du.nii.affine).to_filename(finemask_fn)
+
+        du.morph_ops_nii(finemask_fn, op='opening', rad=5.0, odt='char', shenv=nogz_env)
+        finemask = nib.load(finemask_fn).get_fdata().astype('bool')
+
+
+        # Was going to threshold here, but not necessary/possible to improve on above
+        #  ... Choose a threshold higher than 0.001 -- perhaps 1/300 of the T2w mean signal?
+        #      Just make sure it's well below the signal of globus pallidus
+
+        write_out_mask(finemask, finemask_fn, out_dir)
+
+        # clean up and close
+        shutil.rmtree(du.tmpd)
+        return
+
+
+    # !!! edit below -- pass tensor SSE file if we want the following to run?
+    # 7. Create processed images
+
+    #  >> normsub no longer used
+    # # SigSub/SigRatio images
+    # print('Calculating SigSub...')
+
+    # dw_sub = np.zeros(dwi_emcdata.shape[:-1])
+    # dw_sub[roughmask] = t2w_mean[roughmask] - dw_mean_t2reg[roughmask]  # very similar to t2w_mean contrast
+
+    # dw_std = np.std(dwi_emcdata[...,dw_vols], axis=3)
+    # # note -- dwi_std is a kind of WM map! so use normfac to normalize instead
+
+    # # dw_stdsub = np.zeros(dwi_emcdata.shape[:-1])
+    # # dw_stdsub[roughmask] = dw_sub[roughmask]/dw_std[roughmask]          # this is useful, threshold at somewhere btw 0 and 1
+
+    # # Normalize subtraction by mean std in "background"
+    # normfac = np.mean(dw_std[roughfast_seg == 4])
+
+    # dw_normsub = np.zeros(dwi_emcdata.shape[:-1])
+    # dw_normsub[roughmask] = dw_sub[roughmask]/normfac
+
+    # dw_normsub_fn = f'{du.tmpd}/dw_normsub.nii'
+    # du.make_nii(dw_normsub, new_aff=nii.affine).to_filename(dw_normsub_fn)
+
+    # normsub_bg_vals = dw_normsub[roughfast_seg == 4]
+    # dw_normsub_mask = dw_normsub > np.percentile(normsub_bg_vals, 50)    # good compromise -- generates a few false positives around the ventricles that can be cleaned up with morph operations
+
+    # dw_normsub_mask_fn = f'{du.tmpd}/dw_normsub_mask.nii'
+    # du.make_nii(dw_normsub_mask, new_aff=nii.affine).to_filename(dw_normsub_mask_fn)
+
+
+    # # maybe use log-difference? this equals log of ratio...
+    # # note there are many 0's (~ 5%), so this generates a warning.
+    # #   consider using a mask here
+    # dw_logsub = np.log(t2w_mean/dw_mean_t2reg)   # no signal diff (ratio of 1) -> logsub of 0; signal decrease (ratio < 1) -> negative logsub
+
+    # # logsub from mean of minimum 5 elements in dwi
+    # dwi_partd = np.partition(dwi_emcdata[...,dw_vols], 5, axis=3)
+    # dwi_minmean = np.mean(dwi_partd[...,:5], axis=3)
+    # dw_logsub2 = np.log(t2w_mean/dwi_minmean)
+
+    # dw_stdsub     # dw_stdsub > 0.75 is a good compromise -- generates a few false positives around the ventricles that can be cleaned up with morph operations
+    #      nzmean    P2   P50    P98
+    #   csf: 66.4 15.55  54.3  186.8
+    #    gm: 18.3  5.61  16.2   42.6
+    #    wm:  7.4  2.42   6.1   22.4        P1 = 2.06
+    #    bg:  5.4 -1.99   3.8   21.8
+
+    # dw_normsub
+    #      nzmean    P2   P50    P98
+    #   csf: 85.3  33.2  73.2  190.5
+    #    gm: 25.0  13.4  23.4   44.3
+    #    wm: 13.0   6.6  12.7   23.0
+    #    bg:  5.3  -1.5   3.7   15.8
+
+    # ^^ examined these for usefulness compared to entropy
+    # - normsub looks useful @ 3.7, logsubs do not appear to offer anything beyond that
+    # - leave these out: PS-Entropy and MSE are more useful and easier to cite
+
+
+    # Entropy
+    if use_ent:
+        print('dmasks: Calculating entropy...')
+
+        # moved to dmri_utils
+        foo = du.calc_entropy(bar)
+
+
+    # SSE/MSE images from tensor model
+
+    # Run FSL's dtifit to create SSE image
+    tensor_bn = f'{du.tmpd}/wdt'
+
+    print("Fitting tensor and calculating MSE")
+
+    sp.run('$FSLDIR/bin/dtifit'
+           ' --sse --wls --save_tensor'
+           ' --data={0} --out={1} --mask={2}'
+           ' --bvecs={3} --bvals={4}'
+           ''.format(dwi_emcdata_fn, tensor_bn, roughmask_fn, rbvecs_fn, bvals_fn),
+            shell=True, check=True, env=nogz_env, stdout=sp.DEVNULL)
+
+    sse = nib.load(tensor_bn + '_sse.nii').get_fdata()
+
+    # LDT
+    #       nzmean     P2   P50   P98
+    #   csf:   0.9  0.037  0.19   8.1
+    #    gm:   0.5  0.039  0.13   5.5
+    #    wm:   0.7  0.079  0.25   7.7
+    #    bg:  21.9  0.205 15.06  86.7
+    #   eye:   8.6  3.412  8.24  15.8
+
+    # WLS
+    #       nzmean     P2   P50   P98
+    #   csf:   1.4  0.038  0.20  14.4
+    #    gm:   0.7  0.039  0.13   8.3
+    #    wm:   1.1  0.080  0.26  12.1
+    #    bg:  45.0  0.211 25.67 216.8
+    #   eye:  13.9  4.731 13.19  27.7
+
+    # ^^ tested LDT vs WLS tensors -- choose WLS because difference btw P2 of
+    #    eyeball and P50 of tissue is more different
+
+    # Calculate mean-squared error: sse/edof
+    N = t2w_vols.sum() + dw_vols.sum()  # SSE includes all b=0, and S_0 is an estimated parameter,
+    mse = sse/(N - 6 - 1)               # so 7 params and N = all volumes
+
+    du.make_nii(mse, new_aff=du.nii.affine).to_filename(tensor_bn + '_mse.nii')
+
+
+    # Calculate standard error of the estimate: sqrt(mse)
+    # see = np.sqrt(mse)
+    # du.make_nii(see, new_aff=du.nii.affine).to_filename(tensor_bn + '_see.nii')
+
+    # SEE
+    #       nzmean     P2   P50   P98
+    #   csf:  0.16  0.039  0.09  0.77
+    #    gm:  0.11  0.040  0.07  0.59
+    #    wm:  0.14  0.058  0.10  0.71
+    #    bg:  1.13  0.093  1.03  3.00
+    #   eye:  0.74  0.444  0.74  1.07
+
+
+    # 8. Resample and smooth maps to be used for segmentation
+    print("Resampling and smoothing parameter maps")
+    # Resample images to 2 mm isotropic res
+    #   n.b. originally resampled all 37 input vols, took very long time
+    #   also this introduces some smoothing; good idea to just resample the maps
+    #   to be smoothed/segmented
+    mse_rsmp, aff_rsmp = du.resample_image(mse, du.nii.affine)
+    mask_rsmp, _      = du.resample_image(roughmask, du.nii.affine)
+    t2w_rsmp, _ = du.resample_image(t2w_mean, du.nii.affine)
+
+    # MSE can't be negative! good old splines...
+    mse_rsmp[mse_rsmp < 0] = 0
+    t2w_rsmp[t2w_rsmp < 0] = 0
+
+    if use_ent:
+        ent_rsmp, _       = du.resample_image(ent_ps, du.nii.affine)
+        ent_rsmp[ent_rsmp < 0] = 0
+
+    # mse_rsmp_fn = tensor_bn + '_mse_rsmp.nii.gz'
+    # du.make_nii(mse_rsmp, new_aff=aff_rsmp).to_filename(mse_rsmp_fn)
+
+    # ent_rsmp_fn = tensor_bn + '_ent_rsmp.nii.gz'
+    # du.make_nii(ent_rsmp, new_aff=aff_rsmp).to_filename(ent_rsmp_fn)
+
+
+    # Smooth data
+    mse_gs = du.gauss_smooth(mse_rsmp)
+    # mse_as = anis_smooth(mse_rsmp, aff_rsmp)
+    mse_asgs = du.anis_smooth(mse_gs, aff_rsmp)
+
+    # du.make_nii(mse_gs, new_aff=aff_rsmp).to_filename(tensor_bn + '_mse_gs.nii.gz')
+
+    # ^^ resampling reduces mse.max 37.5 -> 35
+    # gauss reduces it 35 -> 24;
+    # anisotropic 35 -> 25;
+    # combo -> 18
+
+    if use_ent:
+        ent_ps_gs = du.gauss_smooth(ent_rsmp)
+        # ent_ps_as = du.anis_smooth(ent_rsmp, aff_rsmp)
+        ent_ps_asgs = du.anis_smooth(ent_ps_gs, aff_rsmp)
+
+
+    # if len(dwi_data.shape) == 4:
+    #     # handle volumes individually
+    #     for v in range(dwi_data.shape[3]):
+    #         smdata = du.anis_smooth(data_rsmp[...,v], aff_rsmp)
+
+    #         du.make_nii(smdata, new_aff=du.nii.affine).to_filename(out_dir + v + '.nii')
+
+
+    # 9. Segment using a clustering algorithm
+
+    # Consider the pros and cons of each metric:
+    #   T2W: good CSF/BG contrast; WM is very dark
+    #   DW: good contrast btw all 3 tissues (GM > WM > CSF, however CSF is very
+    #       dark, indistinguishable from BG; Glbus pallidus is also very dark, but not
+    #       as dark as CSF), and some high-signal artifact due to distortion,
+    #       consider using interpolation on it. As is, use 4 clusters:
+    #       Artifact > GM > WM > CSF & BG (or 5, with globus pallidus?)
+    #   PS-Entropy: identification of high noise BG and CSF, which are not
+    #        distinguishable (e.g. basal cisterns); med signal in WM, low signal
+    #        in GM and deep CSF
+    #   PSE-XFM: standardized; very high signal in GM & deep CSF; med in WM, low
+    #            signal in BG and basal CSF
+    #   MSE: very high signal in some "true" background areas; little elsewhere
+    #   MSE-XFM: standardized; high signal and little contrast within the brain;
+    #            very low signal in most BG; medium signal in basal CSF
+
+    # Other considerations:
+    # - maybe it's OK to eliminate noisy CSF along with eyeballs; since we'll be
+    #   registering the FA-maps anyway, this just saves calculation time
+    # - maybe make 2 masks: (1) get rid of the worst offenders in MSE and lowest signal,
+    #   i.e. the definite BG voxels, but perhaps keeps the eyeballs; (2) also get rid of
+    #   noisy CSF, eyeballs, and probable BG voxels but leaves a jagged edge; this is
+    #   for quantitative maps like FA.
+    # - for (1), use MSE-XFM/3 and T2W/4
+    # - for (2), use DW/3or4, MSE-XFM/3, PSE-XFM/3or4
+    # - mask (1) can be called bmask; mask (2) qmask, for quantitative (i.e. input to dtifit).
+    #   And the present script can be called dmri_masks.
+    # - consider whether STD is the right normalizer for MSE and PS-Entropy; maybe use MAD?
+    # - can we get a proper segmentation out too? perhaps GM/WM contrast from DW and PSE-XFM,
+    #   and CSF/everything else from T2W
+    # - I ran them through fast:
+    #   fast -N --type=2 --class=4 -o fast_clusters_3 --channels=2 t2w_mean dw_mean_t2reg mse_xfm
+    #   ^^ results were not great
+    # - In k-means, you can scale the values to give some more weight than others
+    # - Consider using silhouette analysis to decide on no. of clusters:
+    #   https://scikit-learn.org/stable/auto_examples/cluster/plot_kmeans_silhouette_analysis.html
+    #   also maybe agglomeration of clusters?
+    # - The 3-cluster results from mse_xfm alone are *very* promising -> segments to
+    #   BG/Good signal/Noisy signal (incl eyes)
+    #   Even the 2-cluster results look quite good -- gets rid of some of the eye
+    # - The T2-w and DW images have build-ups of signal near the edges of distortion due to
+    #   inhomogeneous background field. This can throw off the k-means seg -- should tamp down
+    #   the high signal in DW image to mean+2SD of GM and in T2W to mean+2SD of CSF, or
+    #   introduce a specific cluster for just those values.
+    # - Using bet on the dw-mean image has similar problems to t2w-mean. Using otsu or a
+    #   2-cluster k-means on dw-mean seems good at first, but does exclude the globus pallidus
+    #   and the parts of the lateral ventricles. MSE seems like a better option.
+
+    # So, do my own k-means of MSE and PS-Entropy
+    mse_vec = mse_asgs[mask_rsmp]
+    if use_ent:
+        ent_ps_vec = ent_ps_asgs[mask_rsmp]        # ent_ps_vec.shape -> (107873,)
+    # sub_vec = dw_normsub[roughmask]
+    # see_vec = see[roughmask]
+
+
+    # Transform MSE and PS-Entropy using a decreasing function with min 0; max 1.0
+    msex_vec = np.exp(-1*mse_vec)
+
+    # ^^ I like no normalization better for MSE. Tried SEE, MSE-XFM is more conservative
+    #    than SEE-XFM, but still gets rid of the eyeball and basal cisterns. I like it.
+
+    # Also try with a transform to get low values lower. Perhaps cite:
+    #   R. Gonzalez and R. Woods, Digital Image Processing, 3rd ed. Pearson Prentice Hall, 2008.
+    #   or Bauckhage: 10.13140/RG.2.1.4125.3606
+    # Could use gamma correction with gamma=1.5, e.g.:
+    def gamma_xfm(x, gamma):
+        # tested with gamma = 1.5, 2, 3
+        return x**gamma
+
+    msex_vec = gamma_xfm(msex_vec, 1.5)
+
+    # Alternative: use tanh, that keeps high values high, low values low:
+    def tanh_xfm(x, sigma=3.5):
+        # tested with sigma 3 -> 4
+        return np.tanh((x - 0.5)*sigma)*0.5 + 0.5
+
+    # msex_vec = tanh_xfm(msex_vec)
+    # ^^^ gamma was better at getting the mid values lower (i.e. removing eyeball)
+
+    msex_rsmp = vec_to_img(msex_vec, mask_rsmp)
+    du.make_nii(msex_rsmp, new_aff=aff_rsmp).to_filename(f'{du.tmpd}/mse_xfm.nii')
+
+
+    # see_dec_vec = np.exp(-1*see_vec)
+
+    # ^^ SEE-XFM also has good contrast, test it in kmeans x 2,3,4:
+    #    4 doesn't make sense; 2 is great for (1); 3 is good, but may trim out the
+    #    Globus pallidus, which is GM but still a bit worrisome. I like MSE better.
+
+
+    if use_ent:
+        psex_vec = np.exp(-1*ent_ps_vec/ent_ps_vec.std())
+        # psex_vec2 = np.exp(-1*ent_ps_vec)
+
+        psex_rsmp = vec_to_img(psex_vec, mask_rsmp)
+        du.make_nii(psex_rsmp, new_aff=aff_rsmp).to_filename(f'{du.tmpd}/ent_ps_xfm.nii')
+
+        # ^^ PSE-XFM is a little harsh in flagging tissue for exclusion; best option is 4
+        #    clusters and keep 3. The col2 version does not improve things. Overall PS-Entropy seems
+        #    to have more false positives than MSE, since there is so much GM/WM contrast. The
+        #    PS-Entropy depends strongly on the signal level also. Doesn't do as well as MSE at
+        #    eliminating the eyeball.
+
+
+    # >> Not segmenting the T2W or DW images anymore -- MSE and PS-Entropy get the job done better, I think,
+    #    without excluding the globus pallidus
+    # # Transform t2w values, so we don't get 3 clusters of CSF and then 'everything else'
+    # from scipy.stats import boxcox
+    # t2w_vec_xfm, l = boxcox(t2w_vec+1)
+    # # l = 0.332; cube-root
+
+    # # ^^ this helps the sementation
+    # # Another idea: fit a rayleigh distribution to the CSF signal. See:
+    # #   - http://mathworld.wolfram.com/RayleighDistribution.html
+    # #   - https://en.wikipedia.org/wiki/Rayleigh_distribution
+    # #   - https://stackoverflow.com/questions/25828184/fitting-to-poisson-histogram
+    # #   Then, using the PDF, convert values to normal distribution with same mean and
+    # #   variance.
+    # # Or try k-medians to be robust against skewness:
+    # #   - copy gist from https://gist.github.com/mblondel/1451300; replace xrange with range
+    # #   kmedians = KMedians(k=4).fit(t2w_vec_xfm[:,None])
+    # #   labs = kmedians.labels_
+    # #   - ^^ gave almost the same results as kmeans on xfm data
+
+    # # Similarly for DW
+    # dw_vec_xfm, l = boxcox(dw_vec+1)
+
+
+    # E.g. for multivariate k-means
+    # X = np.stack([t2w_vec, dw_vec, psex_vec, msex_vec], axis=1)     # X.shape -> (107873, 4)
+    # kmeans = KMeans(n_clusters=4).fit(X[:, [0, 5]])
+
+
+    # Do univariate K-Means clustering of MSE and PS-Entropy
+    mse_labs_vec = find_kmeans_labs(msex_vec, 3, 'MSE')
+    mse_labs_rsmp = vec_to_img(mse_labs_vec, mask_rsmp)
+    # du.make_nii(mse_labs_rsmp, new_aff=aff_rsmp).to_filename(f'{du.tmpd}/mse_labs_rsmp.nii')
+
+    if use_ent:
+        ent_labs_vec = find_kmeans_labs(psex_vec, 4, 'PSE')
+        ent_labs_rsmp = vec_to_img(ent_labs_vec, mask_rsmp)
+        # du.make_nii(ent_labs_rsmp, new_aff=aff_rsmp).to_filename(f'{du.tmpd}/ent_labs_rsmp.nii')
+
+
+    # # Note T2W + MSE combined have the power to make noisy CSF and noisy BG look totally different!
+    # from sklearn.preprocessing import StandardScaler
+
+    # data = np.stack([t2w_vec_xfm, msex_vec], axis=1)
+
+    # scaler = StandardScaler().fit(data)
+    # data = scaler.transform(data)
+    # data = np.stack([data[:,0], 2*data[:,1]], axis=1)   # double the importance of MSE
+
+    # kmeans = KMeans(n_clusters=4).fit(data)
+    # labs = kmeans.labels_
+
+    # # plot the results!
+    # fig, ax = plt.subplots()
+    # ax.scatter(data[:, 0], data[:, 1], c=labs, s=10, cmap='viridis')
+    # ax.set_xlabel('T2')
+    # ax.set_ylabel('MSE')
+    # fig.savefig('bm_test/km_clusts_t2_mse_4b.png', dpi=144)
+
+    # # ^^ this looks promising, check the seg image
+    # #    worked OK, but I like plain MSE better
+
+
+    # vv other clustering methods that did not work
+
+    # # Spectral clustering
+    # # From the docs, use img_to_graph to use the gradient of an image as a (dis-)simmilarity index, then
+    # # use Gaussian (RBF, heat) kernel: np.exp(- dist_matrix ** 2 / (2. * delta ** 2)), Where ``delta`` is
+    # # a free parameter representing the width of the Gaussian kernel.
+    # # Another alternative is to take a symmetric version of the k nearest neighbors connectivity matrix of the points.
+    # #   -> could "train" on the t2w roughfast segmentation, then use other contrasts for knn?
+    # #   -> for knn example, see https://stackabuse.com/k-nearest-neighbors-algorithm-in-python-and-scikit-learn/
+
+    # from sklearn.feature_extraction import image
+
+    # from sklearn.cluster import spectral_clustering
+    # graph = image.img_to_graph(mse_xfm, mask=roughmask)
+    # labels = spectral_clustering(graph, n_clusters=3)
+    # spec_clusters = np.zeros(dwi_emcdata.shape[:-1])
+    # spec_clusters[roughmask] = labels + 1
+    # spec_clusters_fn = f'{du.tmpd}/spec_clusters-msedec_3.nii'
+    # du.make_nii(spec_clusters, new_aff=du.nii.affine).to_filename(spec_clusters_fn)
+
+    # # ^^ results have nothing to do with a proper sementation
+
+
+    # # MeanShift clustering
+    # from sklearn.cluster import MeanShift
+
+    # meanshift = MeanShift().fit(data)
+
+    # labs = meanshift.labels_
+    # ms_clusters = np.zeros(dwi_emcdata.shape[:-1])
+    # ms_clusters[roughmask] = labs + 1
+    # ms_clusters_fn = f'{du.tmpd}/ms_clusters-t2_msedec.nii'
+    # du.make_nii(ms_clusters, new_aff=du.nii.affine).to_filename(ms_clusters_fn)
+
+    # # ^^ took way too long -- interrupted it.
+
+
+    # # Ward agglomerative clustering
+    # from sklearn.cluster import AgglomerativeClustering
+
+    # wards = AgglomerativeClustering(n_clusters=4).fit(data)
+
+    # # ^^ MemoryError -- needs more memory than I have, evidently
+
+
+    # Create masks from clusters
+    dmask1 = mse_labs_rsmp > 1.5     # 107384 -> 95879 voxels
+    dmask2 = mse_labs_rsmp > 2.5     #        -> 84601
+
+    if use_ent:
+        ent_mask = ent_labs_rsmp > 1.5
+
+
+    # Trim spots where t2w or dw are practically zero
+    dmask1[t2w_rsmp < t2w_rsmp.mean()/300] = False   # T2-W signal < 1 in MCU_0025
+
+
+    # 10. Morphological operations
+    dmask1 = du.mask_morphops(dmask1)
+
+    # full strelem with dia 7 may be too much for dmask2
+    dmask2 = dmask2 & dmask1
+    dmask2 = du.mask_morphops(dmask2, striters=1)
+
+    if use_ent:
+        ent_mask = du.mask_morphops(ent_mask)         # <- PS-Entropy had many false exclusions
+
+
+    # 11. Resample masks back to input resolution, write out, and make plots
+    dmask1, _ = du.resample_image(dmask1, du.nii.affine, fwd=False)
+    dmask2, _ = du.resample_image(dmask2, du.nii.affine, fwd=False)
+
+    assert np.all(dmask1.shape == dwi_data.shape[0:3]), "dmask1 was not resampled properly"
+
+    dmask1_fn = f'{du.tmpd}/dmask1.nii'
+    du.make_nii(dmask1, new_aff=du.nii.affine).to_filename(dmask1_fn)
+
+    dmask2_fn = f'{du.tmpd}/dmask2.nii'
+    du.make_nii(dmask2, new_aff=du.nii.affine).to_filename(dmask2_fn)
+
+
+    # Plot DW signal against T2W and colour with MSE blobs
+    mse_labs, _ = du.resample_image(mse_labs_rsmp, du.nii.affine, fwd=False)
+
+    mse_labs_fn = f'{du.tmpd}/mse_km_labels.nii'
+    du.make_nii(mse_labs, new_aff=du.nii.affine).to_filename(mse_labs_fn)
+
+    mse_labs_vec = mse_labs[roughmask]
+
+    # T2 and DW data to plot against
+    t2w_vec = t2w_mean[roughmask]
+    dw_vec = dwi_emcdata[..., dw_vols].mean(axis=3)[roughmask]
+
+    plot_km_labs(mse_labs_vec, t2w_vec, dw_vec, 'MSE')
+
+
+    # 12. Retain important images in output dir and clean up tmpd
+    print("Writing output files to:", out_dir)
+
+
+    # !!! edit below -- remove custom_reg reference, for one thing
+    print("Need to edit below")
+    import ipdb; ipdb.set_trace()
+
+
+    # move regular files
+    for fn in glob(f'{du.tmpd}/km_labs_*') + [rbvecs_fn]:
+        shutil.move(fn, out_dir)
+
+    # make a copy of bvals
+    bvals_outfn = out_dir + '/' + os.path.basename(rbvecs_fn).replace('bvec', 'bval')
+    shutil.copy(bvals_fn, bvals_outfn)
+
+    if custom_reg:
+        shutil.move(emc_log_fn, out_dir)
+    else:
+        shutil.move(eddy_dirn, out_dir)
+
+    # gzip niftis to out_dir
+    for in_fn in [mse_labs_fn, dmask1_fn, dmask2_fn]:
+
+        bn = os.path.basename(in_fn)
+
+        # shell way:
+        # sp.run('gzip -c infile > outfile.gz')
+
+        out_fn = out_dir + '/' + bn + '.gz'
+
+        # official python way:
+        with open(in_fn, 'rb') as f_in:
+            with gzip.open(out_fn, 'wb') as f_out:
+                shutil.copyfileobj(f_in, f_out)
+
+        # Also copy permissions, mtime, etc
+        shutil.copystat(in_fn, out_fn)
+
+    if use_ent:
+        du.make_nii(ent_mask, new_aff=du.nii.affine).to_filename(out_dir + '/ent_mask.nii.gz')
+
+    # Remove temp. Goodbye!
+    shutil.rmtree(du.tmpd)
+
+
+def find_kmeans_labs(xvec, k, x_name):
+    """Univariate K-Means clustering: return sorted labels as a 3D image volume."""
+
+    # Data must be organized in columns for KMeans input
+    # rows = samples (voxel locs); cols = features (img intensities)
+    kmeans = KMeans(n_clusters=k).fit(xvec[:, None])
+    # - could use n_jobs=-1 to parallelize the fit; but it took about 5 sec
+    # kmeans.labels_ -> same as kmeans.predict(X)
+    # kmeans.cluster_centers_ -> multivariate values
+
+    # Standardize the labels
+    # By default, k-means label-means are randomly ordered
+    # FAST T2W output = 1: CSF, 2: GM, 3: WM, 4: BG
+
+    labs_vec = kmeans.labels_ + 1   # range e.g. 1 -> 3
+    labs_vec *= -1                  # get existing labels 'out of the way'
+
+    # labs_means = np.zeros(k)
+
+    # for i, x in enumerate(uniq_labs):
+    #     vecbool = labs_vec == x
+    #     labs_means[i] = msex_vec[vecbool].mean()
+
+    # labs_sorter = labs_means.argsort()
+
+    uniq_labs = -1*(np.arange(k) + 1)                           # e.g. [  -1,   -2,   -3]
+    labs_sorter = kmeans.cluster_centers_.ravel().argsort()     # e.g. [0.97, 0.17, 0.59] -> [1, 2, 0]
+    sorted_labs = uniq_labs[labs_sorter]                        # e.g. [-2, -3, -1]
+
+    # Replace labs_vec values with standardized label
+    for i, l in enumerate(sorted_labs):
+        labs_vec[labs_vec == l] = i + 1
+
+    # Report cluster centres
+    cntrs_str = np.array_str(kmeans.cluster_centers_.ravel()[labs_sorter], precision=2)
+    print("{} K-Means centers: {}".format(x_name, cntrs_str))
+    with open(f'{du.tmpd}/km_labs_cntrs-{x_name}.txt', 'a') as lf:
+        lf.write(cntrs_str)
+
+    # For MSE, labels will be:
+    # 1: background; minimum MSEX (high MSE)
+    # 2: noisy CSF
+    # 3: good brain data; high values of MSEX
+
+    # For PSE, labels will be:
+    # 1: minimum PSEX (high PSE) is background
+    # 2: next is WM and globus pallidus
+    # 3: next is high quality signal from most GM and CSF
+    # 4: finally lowest PS-Entropy from GM/CSF
+
+    # labels are small positive integers
+    return labs_vec.astype(np.uint8)
+
+
+def plot_km_labs(labs, x, y, labs_name):
+    """Plot the T2W signal against DW signal; use the k-means labels to colour the
+    data points according to their label.
+    """
+
+    fig, ax = plt.subplots()
+    mrkrs = ax.scatter(x, y, s=5, c=labs,
+                       cmap='viridis', alpha=0.5)
+    mrkrs.set_facecolor('none')
+
+    # Use log scales to better visualize the clusters
+    ax.set_xscale('log')
+    ax.set_yscale('log')
+
+    ax.set_xlim((1, x.max()))
+    ax.set_ylim((1, y.max()))
+
+    ax.set_xlabel('T2W Signal')
+    ax.set_ylabel('DW Signal')
+    ax.set_title('{} K-Means Clusters'.format(labs_name))
+
+
+    # Add a small subplot with linear scaling
+    ax_ch = ax.inset_axes([0.02, 0.74, 0.24, 0.24])
+    mrkrs_ch = ax_ch.scatter(x[::25], y[::25],
+                             s=0.5, c=labs[::25],
+                             cmap='viridis', alpha=0.5)
+    mrkrs_ch.set_facecolor('none')
+
+    ax_ch.set_xlim(0, np.percentile(x, 98))
+    ax_ch.set_ylim(0, np.percentile(y, 98))
+
+    ax_ch.xaxis.set_visible(False)
+    ax_ch.yaxis.set_visible(False)
+
+    fig.savefig(f'{du.tmpd}/km_labs_plot-{labs_name}.png', dpi=200)
+
+
+def write_out_mask(mask, mask_fn, out_dir):
+    """Set an output path for the mask to out_dir, gzipping if necessary.
+    """
+
+    mask_outfn = os.path.join(out_dir, os.path.basename(mask_fn))
+
+    if output_gzip:
+        mask_outfn += '.gz'
+
+    if du.verbose:
+        print(f"dmasks: Writing to {mask_outfn}.")
+
+    du.make_nii(mask, new_aff=du.nii.affine).to_filename(mask_outfn)
+
+
+# Entry point
+if __name__ == '__main__':
+
+    # Parse args
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+
+    parser.add_argument('nii_fn', help="4D Nifti file of preprocessed DWI volumes (e.g. dwi_emcorr.nii)")
+    parser.add_argument('--rough', action='store_true', help="Calculte only a rough brain-mask rather than quantitative ones.")
+    parser.add_argument('--fine', action='store_true', help="Calculte a finer brain-mask: pass bias-corrected data, will do segmentation.")
+    parser.add_argument('--entropy', action='store_true', help="Calculate power-spectral entropy mask.")
+    parser.add_argument('--out_dir', help="Directory for output masks (default: same as nii)")
+    parser.add_argument('-v', '--verbose', action='store_true', help="Increase info messages")
+    args = parser.parse_args()
+
+    # Check args
+    if args.out_dir is None:
+        args.out_dir = os.path.dirname(args.nii_fn)
+
+    du.nii = du.check_load_nii(args.nii_fn)     # essentially global since its accessed from du module
+
+    du.verbose = args.verbose
+
+
+    # Run
+    main(args.out_dir, args.rough, args.fine, args.entropy)
+

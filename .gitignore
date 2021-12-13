@@ -1,12 +1,18 @@
 .DS_Store
+._*
 .~lock.*
 
 *.pyc
 
-/archive/
-/testing/
-/data/
-/cb_dti.sublime-workspace
+/archive
+/other
+/testing
+/data
 
 /src/pymer4_dev
-src/statsmodels_dev
+/src/statsmodels_dev
+/src/dMRIharmonization_dev
+/src/nibabel_dev
+/src/AMICO
+/src/DKE
+/src/designer-test

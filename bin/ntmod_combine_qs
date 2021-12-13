@@ -1,0 +1,58 @@
+#!/bin/bash
+
+# combine quadrant data from 4 runs into 1, given 1 argument which is one of the quadrant dirs
+# this functionality is now baked into the sn_ntmod_indiv_job script
+
+# v 0.1 (Nov 2021)
+# by Andrew Davis (addavis@gmail.com)
+
+# Robust options
+set -o nounset    # fail on unset variables
+set -o errexit    # fail on non-zero return values
+set -o pipefail   # fail if any piped command fails
+
+od0="$1"
+[[ -d $od0 ]] || { echo "od0 not found: $od0"; exit 2; }
+
+echo "combining files from 4 quadrants..."
+
+# determine this q and confirm all 4 q-dirs exist
+q=$(echo -n $od0 | sed 's/.*\([1-4]\)of4.*/\1/')
+
+[[ -d ${od0/_${q}of4/_1of4} && \
+   -d ${od0/_${q}of4/_2of4} && \
+   -d ${od0/_${q}of4/_3of4} && \
+   -d ${od0/_${q}of4/_4of4} ]] \
+   || { echo "didn't fine all 4 q-dirs"; exit 2; }
+
+combo_dir="${od0/_${q}of4/}"
+/bin/mkdir "$combo_dir"
+
+# copy zipped log files in
+for qq in 1 2 3 4
+do
+    src_dir="${od0/_${q}of4/_${qq}of4}"
+    /bin/mv "$src_dir"/bedpostx_logs.zip "$combo_dir"/bedpostx_logs_q${qq}.zip
+done
+
+# sum images to combine quarter-masked data
+for nii_path in "$od0"/*.nii.gz
+do
+    nii_bn="$(basename $nii_path)"
+
+    $FSLDIR/bin/fslmaths ${nii_path/_${q}of4/_1of4} \
+                    -add ${nii_path/_${q}of4/_2of4} \
+                    -add ${nii_path/_${q}of4/_3of4} \
+                    -add ${nii_path/_${q}of4/_4of4} \
+                    "${combo_dir}/${nii_bn}"
+
+    /bin/rm ${nii_path/_${q}of4/_[1-4]of4}
+done
+
+# clean up q dirs
+for qq in 1 2 3 4
+do
+    /bin/rmdir "${od0/_${q}of4/_${qq}of4}"
+done
+
+echo "done"

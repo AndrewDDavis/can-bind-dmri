@@ -1,0 +1,432 @@
+#!/bin/bash
+
+# dMRI Brain Extraction
+
+# After a liberal bet brain extraction to start, use level-set thresholding and
+# morphological opening/closing operations to improve binary brain mask.
+
+# Usage: dmri_brainmask t2w_epi_mean
+# Output: mask with datatype char and named as input-bm
+
+# v0.1 (Dec 2018) by Andrew Davis (addavis@gmail.com)
+# Code moved from dti_preprocess (l. 341) and further developed
+
+
+# Robust options
+set -o nounset
+set -o errexit
+set -o pipefail
+shopt -s nullglob
+
+# Parse arguments
+[[ $# -eq 1 ]] || { echo "Error: expected 1 arg: the t2w_epi_mean image"; exit 2; }
+
+t2w="$1"
+
+# Sort out input filenames with or without a specified extension, but must be nii or nii.gz files
+t2w_dir="$(dirname "$t2w")"
+t2w_bn="$(basename "$t2w")" \
+  && t2w_bn_ne="$(remove_ext "$t2w_bn")"
+t2w_path="$(find "$t2w_dir" -name "${t2w_bn_ne}.nii*" -print)" \
+  && t2w_path_ne="$(remove_ext "$t2w_path")"
+t2w_ext="${t2w_path/$t2w_path_ne/}"
+[[ -e "${t2w_path_ne}${t2w_ext}" ]] || { echo "file not found: ${t2w_path_ne}${t2w_ext}"; exit 2; }
+
+# Define output filename
+output_vol="${t2w_path_ne}"-brain_mask"${t2w_ext}"
+
+
+# Start with FSL's bet
+# - f=0.1 gives generous mask
+# - it's too generous in some low signal areas, but
+#   using higher f cuts of anterior portions of these distorted EPI brains
+# bet "$t2w_path_ne" "${t2w_path_ne}"-brain -f 0.1 -m
+
+
+# First deal with signal bias field -- esp. for MCU_A
+t2w_unif="${t2w_path_ne}"-unifize"${t2w_ext}"
+3dUnifize -prefix "$t2w_unif" "$t2w_path"
+# Leaving off the -T2 and -EPI args since they were detrimental to performance
+# in MCU_0025; -GM had no apparent effect
+
+
+# Pad the unifized volume before labelling
+slc_n=$(fslval "$t2w" dim3)
+topslc_idx=$(printf '%04d' "$((slc_n - 1))")    # zero-padded idx of top-slice
+
+# grab the top and bottom slices, fixing their z-locations
+unif_botslice="${t2w_path_ne}"-unif_botslice"${t2w_ext}"
+unif_topslice="${t2w_path_ne}"-unif_topslice"${t2w_ext}"
+fslroi "$t2w_unif" "$unif_botslice" 0 -1 0 -1 0 1
+fslroi "$t2w_unif" "$unif_topslice" 0 -1 0 -1 $topslc_idx 1
+fslmerge -z unif_pad "$unif_botslice" "$t2w_unif" "$unif_topslice"
+
+# note, to get proper image origin, need to use fsledithd to lower sform and qform by 2.5 (slice thickness). Maybe
+#   it's possible to use `3drefit -zorigin` or -dzorigin for this?
+
+# this seems to help -- now we can threshold the resulting ss mask (unif_pad_edt-ss_labels.nii.gz) at 4.5 and have the result
+#   make sense at the top and bottom, then would need to trim the extra slices. Padding with zeroes helps
+#   a bit, but we would still need to use the "keep the 2's and 3's trick".
+
+
+# Try 3dSkullStrip instead of bet
+# - recommended by [Tsang et al.](https://doi.org/10.1109/EMBSW.2007.4454178)
+ss_labels="${t2w_path_ne}"-ss_labels"${t2w_ext}"
+3dSkullStrip -input "$t2w_unif" -shrink_fac 0.55 -blur_fwhm 2 -mask_vol -prefix "$ss_labels"
+# -push_to_edge?
+
+# The output mask volume contains values 0--6:
+# 0: Voxel outside surface
+# 1: Voxel just outside the surface. This means the voxel
+#    center is outside the surface but inside the
+#    bounding box of a triangle in the mesh.
+# 2: Voxel intersects the surface (a triangle), but center
+#    lies outside.
+# 3: Voxel contains a surface node.
+# 4: Voxel intersects the surface (a triangle), center lies
+#    inside surface.
+# 5: Voxel just inside the surface. This means the voxel
+#    center is inside the surface and inside the
+#    bounding box of a triangle in the mesh.
+# 6: Voxel inside the surface.
+
+# Troubleshooting:
+# - if you get "freeglut (3dSkullStrip): failed to open display ''", it suffices to issue `export DISPLAY=':0'`
+# - use -push_to_edge for missing GM in frontal areas
+# - use -shrink_fac_bot_lim for missing cerebellum; default 0.4 with edge, try decreasing it
+# - use lower factor for general clipping: -shrink_fac (default 0.6), start with 0.5 then 0.4
+# - use -ld 30 for missing lobules (default is 30 with -use_edge, which is also default; maybe try 50)
+# - use -blur_fwhm 2 instead of increasing ld for better speed
+# - use -touchup -touchup (i.e. twice) for hole filling
+
+# Found helpful on MCU_0051:
+# -push_to_edge -- helpful for anterior dropout (use this, but it's not quite enough)
+# -shrink_fac 0.5 -- also good for anterior, maybe a litte overzealous, try 0.55
+# -blur_fwhm 2 -- also good for anterior and inferior
+
+# Found *not* helpful on MCU_0051:
+# -shrink_fac_bot_lim -- didn't bring back bottom slice
+# -ld 50 -- kept giving surface self instersecting warnings and starting over, took a long time
+
+# On MCU_0025:
+# - losing a lot of voxels around the brainstem/spinal cord:
+#   -push_to_edge is overzealous, taking in voxels outside CSF; also causes warnings/restarts
+#   - lowering shrink_fac to 0.4 is more effective
+
+
+# Taking just voxels greater than 4.5 may be good for thresholding the mask
+#   - gets rid of most artifacts in the FA image, but you lose the bottom slice
+#   - for bottom slice need to fill in the shell of m=4 voxels (where there are m=2 and 3 voxels)
+#   - also check for low signal: calculate threshold as twice median of
+#     background or 1st percentile in center ROI?
+
+
+# Make provisional mask by thresholding labels, drop the bottom slice
+ss_inmask_prov="${t2w_path_ne}"-ss_inmask_prov"${t2w_ext}"
+fslmaths "$ss_labels" -thr 4.5 -bin "$ss_inmask_prov"
+
+fslsplit "$ss_inmask_prov" "${t2w_path_ne}"-ss_inmask_prov-sl_ -z
+/bin/rm "${t2w_path_ne}"-ss_inmask_prov-sl_0000.nii*
+
+
+# Bottom slice mask
+# - take the 2 & 3 values from the mask, leave the 4s, they represent the "shell" here
+# - clean up the islands and protrusions with morphological opening, then do a closing to be safe(r)
+ss_labels_sl0="${t2w_path_ne}"-ss_labels_sl0"${t2w_ext}"
+fslroi "$ss_labels" "$ss_labels_sl0" 0 -1 0 -1 0 1
+
+ss_sl0_inmask="${t2w_path_ne}"-ss_sl0_inmask"${t2w_ext}"
+fslmaths "$ss_labels_sl0" -thr 1.9 -uthr 3.1 -bin \
+                          -kernel 2D -ero -dilD -dilD -ero \
+                          "$ss_sl0_inmask"
+
+
+# Start an array of the mask slices, bottom first
+outmask_slices=("$ss_sl0_inmask")
+
+
+# Check the top slice as well
+ss_labels_topslice="${t2w_path_ne}"-ss_labels_topslice"${t2w_ext}"
+fslroi "$ss_labels" "$ss_labels_topslice" 0 -1 0 -1 $topslc_idx 1
+
+maxlab=$(fslstats "$ss_labels_topslice" -p 100 | tr -d '[:space:]' | cut -d '.' -f 1)
+if [[ $maxlab -gt 1 ]];
+    # if maximum label value is greater than 1, we might have brain in the top slice
+    /bin/rm "${t2w_path_ne}"-ss_inmask_prov-sl_${topslc_idx}.nii*
+
+    ss_topslice_inmask="${t2w_path_ne}"-ss_topslice_inmask"${t2w_ext}"
+    fslmaths "$ss_labels_topslice" -thr 1.9 -uthr 3.1 -bin \
+                                   -kernel 2D -ero -dilD -dilD -ero \
+                                   "$ss_topslice_inmask"
+
+    outmask_slices+=("${t2w_path_ne}"-ss_inmask_prov-sl_[0-9][0-9][0-9][0-9].nii* "$ss_topslice_inmask")
+
+else
+    outmask_slices+=("${t2w_path_ne}"-ss_inmask_prov-sl_[0-9][0-9][0-9][0-9].nii*)
+fi
+
+
+# Merge bottom and top slices with the rest into total mask
+fslmerge -z "$output_vol" "${outmask_slices[@]}"
+fslmaths "$output_vol" "$output_vol" -odt char
+
+
+# Clean up
+/bin/rm "$t2w_unif" \
+        "$ss_labels" \
+        "$ss_inmask_prov" \
+        "$ss_labels_sl0" \
+        "$ss_labels_topslice" \
+        "${outmask_slices[@]}"
+
+
+echo "foo!"
+exit 0
+
+
+# trouble at the bottom in MCU_0025 -> brainstem/spinal cord is excluded
+# try padding the volume above and below before labelling to save so much processing of top and bottom slices?
+#   OK, so lower sf to 40, pad the top and bottom with data, threshold to 4.5, don't forget to still do morph
+#       opening and closing with a distance-based kernel at the end
+
+
+
+
+
+
+
+# #######
+# Alternate method, BET only, making use of -S, -B. Steps:
+#   1. Liberal BET run that corrects bias-field
+#   2. More stringent BET run that removes eyes and does signal-intensity thresholding
+#   3. Morphological operations to fill holes, trim off islands/protrusions
+
+# t2w_initbet="${t2w_path_ne}"-initbet
+
+bet "$t2w_path_ne" "${t2w_path_ne}"-betB -f 0.1 -m -B # -t -n -R -S -B -Z
+bet "${t2w_path_ne}"-betB "${t2w_path_ne}"-betBSf30t -m -f 0.3 -t -S
+fslmaths "${t2w_path_ne}"-betBSf30t_mask \
+         -fillh26 \
+         -kernel sphere 3.5 \
+         -ero -dilD \
+         -dilD -ero \
+         -dilD -ero \
+         "${t2w_path_ne}"-betBSf30tm_mask \
+         -odt char
+
+# In MCU_0025, if we go to f=0.4, we lose the brainstem
+#                          f=0.35 makes almost no difference compared to 0.30
+
+# Maybe go back to the BET equation -> if I can determine the contrast of CSF/GM in the deep brain, will that help me choose a threshold? The threshold would ideally be robust across different coils and scanners. This area should contain a large amount of CSF and GM. Maybe 20%/80% values give good estimate of GM and CSF signal?
+# - using -o might be useful for paper figures
+# - note t2w_epi_mean-betBSf35tm_mask still contains some values <= 0! Why? Because of the morph operations, but they do add value. Need to do my own thresholding?
+# - Maybe do a quick
+# - Maybe threshold based on noise in extended time-series -- just the b=0 images, or all?
+#   - remember, this data is special, compared to single T1! e.g. ratio of signal during b=0 volumes compared to b=1000 volumes is at least ~ 2:1 for brain voxels. Maybe make a "signal ratio" image from the dwi_merged-ecc volume, and use that to threshold. Maybe compare the "signal ratio to the std of signal within the b=0 images."
+#   dmri_sigts_stats.py 'dwi_merged-ecc.nii.gz' '../dti.bval'
+#   then find a brain/background threshold for sigsub etc... maybe better to run this on bias-corrected images?
+#   also consider running gaussian blur with sigma ~ 1.25 mm on this data first! remember it worked well with AFNI, and that was only fwhm = 2 (sigma ~ 0.85)
+#   and remember to try to correct bias-fields first: is bias-field kept with -d? bet t2w_epi_mean t2w_epi_mean-Btest -d -m -n -f 0.1 -B
+#     -> see t2w_epi_mean-Btest_tmp_premask_bias.nii.gz
+
+
+# Histograms:
+# 3dhistog -nbin 30 -notitle -min 0 -max 3000 -mask t2w_epi_mean-betBSf35tm_mask.nii.gz t2w_epi_mean-betB.nii.gz > hist.csv
+# 1dplot -hist -x hist.csv'[0]' -xlabel intensity -ylabel hist hist.csv'[1]'
+
+
+bet "${t2w_path_ne}"-betB "${t2w_path_ne}"-betBSf40t -m -f 0.4 -t -S
+
+# try -g 0.05 to regain the brainstem? -> did not work, lost the top with +ve -g
+# f=0.4 was just too restrictive; loses anterior brain lobes, brainstem
+
+bet "$t2w_path_ne" "${t2w_path_ne}"-betBtf -m -f 0.3 -t -B # -t -n -R -S -B -Z
+
+
+
+
+
+bet "$t2w_path_ne" "${t2w_path_ne}"-betR -f 0.1 -m -R # -t -n -R -S -B -Z
+# R/S/B/Z are mutually exclusive!
+# -R improves the side "wings" that happen in MCU_0025; so do other options
+# -B helps a lot for correcting the bias-field on the output image
+# -S helps bring the outline in, causes holes in CSF; leaving it off and increasing -f does tend to keep more eyeball
+# -Z seems unnecessary
+# -t helps clean up lower areas and outline, causes holes in middle GM
+# -f 0.5 is too much in MCU_0025
+
+bet "${t2w_path_ne}"-betR "${t2w_path_ne}"-betRB -f 0.1 -m -v -B
+
+bet "${t2w_path_ne}"-betR "${t2w_path_ne}"-betRS -f 0.1 -m -S
+
+bet "${t2w_path_ne}"-betRS "${t2w_path_ne}"-betRSBt -f 0.1 -m -t -B
+
+bet "${t2w_path_ne}"-bet2 "${t2w_path_ne}"-bet3 -f 0.1 -m -t -B    # helps a lot -- but thresholding makes small holes in brain
+
+# -S is fairly agressive at 'notching' CSF
+fast --type=2 -B --out=fast_ $t2w_initbet
+
+
+
+
+# BET program flow: <https://onlinelibrary.wiley.com/doi/full/10.1002/hbm.10062>
+# 1. histogram based estimation of robust min/max/thresh
+#    - t2 and t98; signal/background estimated as 10% of that range
+# 2. COG of head is estimated, radius estimated based on robust intensity range
+#    - tm (median intensity) estimated within that sphere
+# 3. triangular element based sphere initialized based on COG
+# 4. elements deformed to match brain, but keeping them smooth and well-spaced
+# - the main BET parameter is the _local_ threshold btw brain and background; bt in the eqn:
+#   tI = (Imax - t2)*bt + t2
+#   where Imax is the local max intensity, but t2 is the global 2% signal
+# - the tested BET on 35 T1‐weighted, 6 T2‐weighted and 4 proton density MR images
+
+
+
+# see more on morphologic opening and closing operations and when to use them:
+# https://homepages.inf.ed.ac.uk/rbf/HIPR2/open.htm
+# https://homepages.inf.ed.ac.uk/rbf/HIPR2/close.htm
+# in python -> http://scikit-image.org/docs/dev/auto_examples/xx_applications/plot_morphology.html
+# think carefully about when to use opening and closing!
+
+# opening first -- eliminates islands; expands holes in brain
+# closing first -- closes holes in the brain; connects islands
+# do fillh26 -> open -> close -> close?
+
+# could use white/black tophat to find bright/dark areas that are smaller than the kernel. Then
+#   check if there are dark spots "within" the brain... But defining within is kind of the point, right?
+
+# "In real world applications, closing can, for example, be used to enhance binary images of objects obtained from thresholding."
+
+# Maybe do closing first to eliminate gaps, then opening to get rid of protrusions/islands
+
+
+# Strategy for masking fMRI from [Tsang et al.](https://doi.org/10.1109/EMBSW.2007.4454178):
+#  - maximize dynamic range
+#  - Gaussian blur -> GSN image
+#  - binary threshold GSN image -> fmask
+#  - use connected components analysis to close gaps in fmask
+#  - invert fmask -> rmask
+#  - use connected components analysis to remove non-brain matter from mask
+#  - invert rmask -> fmask
+#  - write out
+# cca is something like watershed for binary images. They don't give details of how they
+# used it to fill the gaps.
+
+
+
+# Further restrict mask to >15% of robust max intensity
+# - this seems to work better than increasing f for epi-distorted brains
+# - also fill holes and erode/dilate to trim islands and protrusions
+
+# Finding the intensity of the ventricles got complicated due to extreme bias-field of e.g. MCU_A/MCU_0025_02, where the central CSF has signal about 1/3 of superficial CSF
+#   locate COM and go a bit anterior, then use a 35 mm radius sphere to define central roi
+centrev=($(fslstats ${prep_dir}/t2w_epi_mean-brain -k ${prep_dir}/t2w_epi_mean-brain_mask -C))
+yvoxsize=$(fslval ${prep_dir}/t2w_epi_mean-brain pixdim2 | tr -d '[:space:]')
+zvoxsize=$(fslval ${prep_dir}/t2w_epi_mean-brain pixdim3 | tr -d '[:space:]')
+centrev[1]=$(python -c "print(${centrev[1]} + 10./$yvoxsize)")
+centrev[2]=$(python -c "print(${centrev[2]} + 5./$zvoxsize)")
+fslmaths ${prep_dir}/t2w_epi_mean-brain \
+         -mul 0 -add 1 \
+         -roi ${centrev[0]} 1 ${centrev[1]} 1 ${centrev[2]} 1 0 1 \
+         -kernel sphere 35 \
+         -fmean -thr 1e-8 -bin \
+         ${prep_dir}/t2w_epi_mean-central_roi \
+         -odt char
+
+# Estimate robust-max intensity (i.e. ventricles), but if the
+# threshold is too high, use the low robust int estimate
+# e.g. MCU_A/MCU_0025_02 has limits 209 -> 3457, so we can't use 15% (~ 518)
+int_lims=($(fslstats ${prep_dir}/t2w_epi_mean-brain -k ${prep_dir}/t2w_epi_mean-central_roi -r))
+int_thr=$(python -c "print(${int_lims[1]}*0.15)")
+[[ $(python -c "print($int_thr > ${int_lims[0]})") == True ]] && int_thr=${int_lims[0]}
+
+fslmaths ${prep_dir}/t2w_epi_mean-brain \
+         -thr $int_thr \
+         -bin -fillh26 \
+         -kernel sphere 5.0 \
+         -ero -dilD \
+         -mul ${prep_dir}/t2w_epi_mean-brain_mask \
+         ${prep_dir}/t2w_epi_mean-brain_mask \
+         -odt char
+
+
+
+# Mostly leave t2w_epi_mean-brain alone so it has a smooth edge for registration
+# purposes, but make sure it's within reason
+fslmaths ${prep_dir}/t2w_epi_mean-brain_mask \
+         -kernel sphere 5.0 \
+         -dilD \
+         ${prep_dir}/t2w_epi_mean-brain_mask-dil \
+         -odt char
+
+fslmaths ${prep_dir}/t2w_epi_mean-brain \
+         -mul ${prep_dir}/t2w_epi_mean-brain_mask-dil \
+         ${prep_dir}/t2w_epi_mean-brain \
+         -odt float
+
+# clean up from the masking operations
+imrm ${prep_dir}/t2w_epi_mean-central_roi ${prep_dir}/t2w_epi_mean-brain_mask-dil
+
+
+
+
+
+
+
+# #######
+# Alternate method, use rough mask, bias-field correction, k-means segmentation
+
+# consider re-orienting and neck removal with fslreorient2std and robustfov
+
+# create t2w_mean, dwi_mean, sigsub, wls-sse images; consider using log or sqrt of sse (or calculate se by sqrt/df?) and standardize SSE values to the initial signal level? Perhaps from the mean CSF signal of the bias-corrected roughfast below? 
+
+# rough brain extraction on t2w_epi_mean (recommended before FAST in docs: https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/Fast/StepByStep)
+bet t2w_epi_mean t2w_roughbrain -f 0.1 -m -R
+
+# Compute bias-field
+fast -b --type=2 --class=4 --nopve -o t2w_roughfast t2w_roughbrain
+
+# Note the bias-restored output by fast is thresholded at 0, which is undesirable I think,
+#   so I will do it manually
+fslmaths t2w_roughbrain -div t2w_roughfast_bias t2w_roughbrain_nobias
+
+# Rough-mask and apply bias-correction to images for segmentation
+for im in ../sigsub dwi_mean 
+
+    fslmaths $im -mul t2w_roughbrain_mask ${im}_roughmask
+
+
+
+#   - sigsub is also quite good, especially if you smooth it and threshold at ~ 0
+#   - what about a dwi-mean image? yes
+#   - and use dti-fsl_sse -- this does a great job identifying low signal areas and eyeballs! otsu threshold? k-means?
+# + resample image to 1 mm
+# + we're insterested in edge of brain, not small features, so use gaussian blur (3 mm?)
+# + to smooth more while preserving edges, use anisotropic blur. Ref [Perona&Malik1990](https://ieeexplore.ieee.org/document/56205)
+# + use bias-field correction (BET or FAST) (cite abstract from fMRI masking: https://ieeexplore.ieee.org/document/4454178)
+#   * on Erikson, in _~/Documents/Research_Projects/CAN-BIND_DTI/testing/dmri_brainmask-testing/MCU_0025_02/dti_preprocessed/fast_tests_
+#   * FAST command (https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/FAST#fast):
+#     fast -B -b --type=2 --class=4 -o t2w_roughfast4 t2w_roughbrain
+#       - use -B to output bias-corrected image
+#       - use -b to output bias field
+#       - use --type=2 to indicate T2 image; this just affects the order/value of the tissue maps
+#       - consider --class=4 to allow for non-brain matter in T2 images; this makes a difference to the restore image (seems to improve?)...
+#       - consider multi-channel (-S) with different images like frobenius-norm, md, lambda3?
+#       - this does a very good job of creating the _restore_ bias-corrected image in MCU_0025
+#       - note that an interface of 3 & 4 (WM and BG) doesn't make any sense, but maybe 3=2 in this case?
+#       - consider --nopve: this saves time and makes no difference to the bias-field estimation; however pve segmentation is very different, seems more sensible/accurate
+# + threshold at some value, like 2% GM/WM value from the fast segmentation 
+# + use connected components (see scipy.ndimage.measurements.label, or https://github.com/seung-lab/connected-components-3d, or medpy.filter.binary.largest_connected_component); perhaps remove small components with medpy.filter.binary.size_threshold
+# + use morphological hole filling and opening/closing methods (see scipy.ndimage.morphology)
+# + take advantage of DWI signal characteristics to get a 'skull/dura' shell for negative masking (use "inverse" of sigsub image within the periphery of the initial bet-mask)
+# + use k-means to threshold the image, not medpy.filter.image.otsu, since there's more than one population > 0
+# + resample back to original resolution
+# + make sure lower brainstem/spinal cord is retained
+
+
+
+
+
+
+
