@@ -9,8 +9,8 @@ The code release associated with this publication has a DOI:
 
 Version 2.0 was used to produce the manuscript by Davis et al.: "Biophysical compartment models for single-shell diffusion MRI in the human brain: a model fitting comparison".
 
-The code release associated with this publication is available at the following commit hash:
-
+The code release associated with this publication is available at the following tagged commit:
+https://github.com/AndrewDDavis/can-bind-dmri/releases/tag/v2.0
 
 ## Installation
 
