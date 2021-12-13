@@ -12,13 +12,14 @@ Version 2.0 was used to produce the manuscript by Davis et al.: "Biophysical com
 The code release associated with this publication is available at the following tagged commit:
 https://github.com/AndrewDDavis/can-bind-dmri/releases/tag/v2.0
 
+
 ## Installation
 
-The data files and code/script repository typically live in *~/Documents/Research_Projects/CAN-BIND_dMRI*. The notes and manuscripts associated with the analysis live in *~/Sync/Research_Projects/CAN-BIND_DTI/doc*, and the results live in *~/Sync/Research_Projects/CAN-BIND_DTI/group_results*.
+The data files and code/script repository typically live in *~/Documents/Research_Projects/CBN01_dMRI*. The notes and manuscripts associated with the analysis live in *~/Sync/Research_Projects/CBN01_dMRI/doc*, and the results live in *~/Sync/Research_Projects/CBN01_dMRI/group_results*.
 
 To add the bin directory of this project in the typical location to your PATH variable, use:
 
-    export PATH=~/Documents/Research_Projects/CAN-BIND_dMRI/bin:"$PATH"
+    export PATH=~/Documents/Research_Projects/CBN01_dMRI/bin:"$PATH"
 
 
 ## Paper Citations
@@ -30,13 +31,13 @@ Andrew D. Davis, Stefanie Hassel, Stephen R. Arnott, Geoffrey B. Hall, Jacquelin
 
 ## Contact
 
-Andrew D. Davis, PhD
+Andrew D. Davis, PhD\
 Postdoctoral Fellow, University of Toronto
 
-Rotman Research Institute
-Baycrest Health Sciences
-3560 Bathurst Street, North York
+Rotman Research Institute\
+Baycrest Health Sciences\
+3560 Bathurst Street, North York\
 Ontario, Canada  M6A 2E1
 
-adavis@research.baycrest.org
+adavis@research.baycrest.org\
 [Research Profile](https://andrewddavis.bitbucket.io/profile/)
